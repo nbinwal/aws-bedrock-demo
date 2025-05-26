@@ -5,6 +5,12 @@
 
 Foundation models (like Anthropic Claude) are trained on massive technical corpora (docs, blogs, forums). When you send a prompt, they generate responses based on patterns they've learned.
 
+This POC:
+
+- Monitors an EC2 instance's CPU utilization using CloudWatch.
+- Triggers a Lambda function when CPU usage exceeds 75%.
+- Invokes Amazon Bedrock to get remediation steps.
+
 ---
 
 ## 🛠️ Step-by-Step Implementation
