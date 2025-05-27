@@ -92,53 +92,64 @@ This POC:
 
    ```python
    import json
-   import boto3
+import boto3
 
-   def lambda_handler(event, context):
-       # 1. Log the raw event for debugging
-       print("Received event:", json.dumps(event))
+def lambda_handler(event, context):
+    print("Received event:", json.dumps(event))
 
-       # 2. Extract details from the CloudWatch Alarm event
-       detail = event.get('detail', {})
-       alarm_name = detail.get('alarmName', 'UnknownAlarm')        # Alarm name
-       timestamp = detail.get('state', {}).get('timestamp', '')    # When alarm fired
+    # Extract alarm details
+    detail = event.get('detail', {})
+    alarm_name = detail.get('alarmName', 'UnknownAlarm')
+    timestamp = detail.get('state', {}).get('timestamp', '')
 
-       # 3. Build a prompt string for Bedrock
-       prompt = (
-           f"EC2 Alarm '{alarm_name}' fired at {timestamp} due to CPU >= 75%. "
-           "Provide a numbered list of steps to troubleshoot and fix this issue."
-       )
+    # Create the prompt
+    user_prompt = (
+        f"EC2 Alarm '{alarm_name}' fired at {timestamp} due to CPU ≥ 75%. "
+        "Provide a numbered list of steps to troubleshoot and fix this issue."
+    )
 
-       # 4. Initialize the Bedrock client (in us-east-1 region)
-       client = boto3.client('bedrock-runtime', region_name='us-east-1')
+    # Prepare request body for Claude 3
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "messages": [
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ],
+        "max_tokens": 500,
+        "temperature": 0.5
+    })
 
-       # 5. Prepare the API request body
-       body = json.dumps({
-           "prompt": prompt,              # Instruction for FM
-           "max_tokens_to_sample": 300,   # Limit response length
-           "temperature": 0.5             # Lower = more deterministic
-       })
+    # Bedrock client
+    client = boto3.client("bedrock-runtime", region_name="us-east-1")
 
-       # 6. Invoke the model
-       response = client.invoke_model(
-           modelId="anthropic.claude-v2",  # FM identifier
-           contentType="application/json",  # Sending JSON
-           accept="application/json",       # Expect JSON
-           body=body
-       )
+    # Your Inference Profile ARN for Claude 3.5
+    model_id = "arn:aws:bedrock:us-east-1:657506130129:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 
-       # 7. Parse the model's response
-       data = json.loads(response['body'].read())
-       advice = data.get('completion', 'No advice returned')
+    # Invoke the model
+    response = client.invoke_model(
+        modelId=model_id,
+        contentType="application/json",
+        accept="application/json",
+        body=body
+    )
 
-       # 8. Log the advice (visible in CloudWatch Logs)
-       print("Remediation advice:\n", advice)
+    # Parse response
+    response_body = json.loads(response["body"].read())
+    advice = ""
 
-       # 9. Return the advice as the Lambda response body
-       return {
-           'statusCode': 200,
-           'body': json.dumps({'advice': advice})
-       }
+    if "content" in response_body:
+        advice = "\n".join(part["text"] for part in response_body["content"] if "text" in part)
+    else:
+        advice = "No advice returned."
+
+    print("Remediation advice:\n", advice)
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({'advice': advice})
+    }
    ```
 
    * **Deploy** the code.
