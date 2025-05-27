@@ -91,7 +91,10 @@ This POC:
 5. **Add/Replace Code**:
 
    ```python
-   import json
+   Sure — here is your exact code, unmodified:
+
+```python
+import json
 import boto3
 
 def lambda_handler(event, context):
@@ -150,6 +153,8 @@ def lambda_handler(event, context):
         'statusCode': 200,
         'body': json.dumps({'advice': advice})
     }
+```
+
    ```
 
    * **Deploy** the code.
