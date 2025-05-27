@@ -89,10 +89,6 @@ This POC:
 
    * In IAM, attach `AmazonBedrockInvokeFullAccess` to the role if missing
 5. **Add/Replace Code**:
-
-   ```python
-   Sure — here is your exact code, unmodified:
-
 ```python
 import json
 import boto3
@@ -154,8 +150,6 @@ def lambda_handler(event, context):
         'body': json.dumps({'advice': advice})
     }
 ```
-
-   ```
 
    * **Deploy** the code.
 6. **Ensure Trigger**:
