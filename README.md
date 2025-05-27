@@ -1,7 +1,7 @@
 # aws-bedrock-demo
 ---
 
-## 🧠 How Does Amazon Bedrock Provide Remediation?
+## How Does Amazon Bedrock Provide Remediation?
 
 Foundation models (like Anthropic Claude) are trained on massive technical corpora (docs, blogs, forums). When you send a prompt, they generate responses based on patterns they've learned.
 
@@ -13,7 +13,7 @@ This POC:
 
 ---
 
-## 🛠️ Step-by-Step Implementation
+## Step-by-Step Implementation
 
 ### Step 1: Launch & Prepare EC2
 
@@ -93,61 +93,115 @@ This POC:
 import json
 import boto3
 
+# === Set up AWS service clients once (so we don’t redo it every time) ===
+# SNS client: used to send emails (notifications) via an SNS topic
+sns_client = boto3.client('sns')
+# Bedrock client: used to call the AI model (Anthropic Claude v2) for troubleshooting advice
+bedrock_client = boto3.client('bedrock-runtime', region_name="us-east-1")
+
+# === Configuration constants ===
+MODEL_ID = "anthropic.claude-v2"  # Which AI model to use
+# The SNS topic where CloudWatch alarms arrive and where we publish remediation emails
+SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:657506130129:SmartOpsAlertTopic"
+
+
 def lambda_handler(event, context):
+    """
+    This Lambda function runs automatically whenever a CloudWatch alarm fires.
+    1. It reads the alarm details from the incoming event.
+    2. It asks Bedrock (the AI service) for troubleshooting steps plus AWS doc links.
+    3. It emails that advice back out via the same SNS topic.
+    """
+
+    # 1) Show the full event in the logs for debugging if something goes wrong
     print("Received event:", json.dumps(event))
 
-    # Extract alarm details
-    detail = event.get('detail', {})
-    alarm_name = detail.get('alarmName', 'UnknownAlarm')
-    timestamp = detail.get('state', {}).get('timestamp', '')
+    # 2) Pull out the actual alarm data from the SNS wrapper
+    try:
+        # event['Records'][0]['Sns']['Message'] is a JSON string of the alarm details
+        sns_msg = json.loads(event['Records'][0]['Sns']['Message'])
+    except Exception as e:
+        # If we can’t parse the alarm data, stop here and log the error
+        print("Error parsing SNS message:", str(e))
+        return {
+            'statusCode': 400,
+            'body': 'Invalid SNS message format'
+        }
 
-    # Create the prompt
-    user_prompt = (
-        f"EC2 Alarm '{alarm_name}' fired at {timestamp} due to CPU ≥ 75%. "
-        "Provide a numbered list of steps to troubleshoot and fix this issue."
+    # 3) Extract the alarm name and the time it changed state
+    alarm_name = sns_msg.get('AlarmName', 'UnknownAlarm')
+    timestamp = sns_msg.get('StateChangeTime', 'UnknownTime')
+
+    # 4) Build the text prompt we send to the AI model.
+    #    - It starts with "Human:" so Claude knows it’s our request.
+    #    - It ends with "Assistant:" so Claude knows where to put its answer.
+    #    - We explicitly ask for at least two official AWS docs URLs at the end.
+    prompt = (
+        f"Human: EC2 Alarm '{alarm_name}' fired at {timestamp} due to CPU ≥ 75%.\n"
+        "Provide a concise paragraph describing how to troubleshoot and resolve this issue. "
+        "Then list at least two official AWS public documentation URLs (one per line) that "
+        "would help a cloud engineer implement the fix.\n"
+        "Assistant:"
     )
 
-    # Prepare request body for Claude 3
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "messages": [
-            {
-                "role": "user",
-                "content": user_prompt
-            }
-        ],
-        "max_tokens": 500,
-        "temperature": 0.5
+    # Pack our prompt into the format Bedrock expects
+    bedrock_payload = json.dumps({
+        "prompt": prompt,
+        "max_tokens_to_sample": 400,  # allow room for text + links
+        "temperature": 0.5            # 0.5 = balanced creativity
     })
 
-    # Bedrock client
-    client = boto3.client("bedrock-runtime", region_name="us-east-1")
+    # 5) Call the Bedrock AI service
+    try:
+        response = bedrock_client.invoke_model(
+            modelId=MODEL_ID,
+            contentType="application/json",
+            accept="application/json",
+            body=bedrock_payload
+        )
+        # Read and parse the AI’s reply
+        body = json.loads(response["body"].read())
+        advice = body.get("completion", "No advice returned.")
+    except Exception as e:
+        # If the AI call fails, log and use a fallback message
+        print("Error invoking Bedrock:", str(e))
+        advice = "Could not retrieve remediation advice from Bedrock."
 
-    # Your Inference Profile ARN for Claude 3.5
-    model_id = "arn:aws:bedrock:us-east-1:657506130129:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    # Log what we got back from the AI
+    print("Remediation advice + links:\n", advice)
 
-    # Invoke the model
-    response = client.invoke_model(
-        modelId=model_id,
-        contentType="application/json",
-        accept="application/json",
-        body=body
+    # 6) Prepare the email subject and body
+    subject = f"[Alert] EC2 Alarm: {alarm_name}"
+    message = (
+        f"The EC2 CloudWatch alarm '{alarm_name}' was triggered at {timestamp}.\n\n"
+        "=== Troubleshooting & Remediation ===\n"
+        f"{advice}"
     )
 
-    # Parse response
-    response_body = json.loads(response["body"].read())
-    advice = ""
+    # 7) Send the remediation email back out via SNS
+    #    We add a message attribute "source=remediation" so our Lambda won’t
+    #    accidentally re-trigger itself on this email.
+    try:
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=message,
+            MessageAttributes={
+                "source": {
+                    "DataType": "String",
+                    "StringValue": "remediation"
+                }
+            }
+        )
+        print("Remediation advice + links sent via SNS.")
+    except Exception as e:
+        # If sending fails, log the error
+        print("Error sending SNS message:", str(e))
 
-    if "content" in response_body:
-        advice = "\n".join(part["text"] for part in response_body["content"] if "text" in part)
-    else:
-        advice = "No advice returned."
-
-    print("Remediation advice:\n", advice)
-
+    # 8) Return success so AWS knows our Lambda ran fine
     return {
         'statusCode': 200,
-        'body': json.dumps({'advice': advice})
+        'body': json.dumps({'status': 'ok'})
     }
 ```
 
@@ -168,16 +222,7 @@ def lambda_handler(event, context):
    stress --cpu 2 --timeout 180 # 2 vCPUs at 100% for 3 minutes
    ```
 2. **Check Alarm**: CloudWatch → Alarms → `POC-HighCPU` → State = ALARM
-3. **View Logs**: Lambda → Monitor → View logs in CloudWatch → latest stream → find the printed advice
-
----
-
-## Troubleshooting Tips
-
-* **Lambda Timeout**: Increase under Configuration → General configuration → Edit
-* **IAM Errors**: Confirm `LambdaBedrockExecutionRole` has CloudWatch Logs + Bedrock policies
-* **Region**: Verify Bedrock support in your region (us-east-1)
-* **Agent Metrics**: Check CloudWatch Metrics to see incoming CPU data
+3. **View Logs**: Lambda → Monitor → View logs in CloudWatch → latest stream → find the printed advice. Advice also emailed to specified IDs directly with AWS links!
 
 ---
 
