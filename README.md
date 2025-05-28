@@ -90,52 +90,62 @@ This POC:
    * In IAM, attach `AmazonBedrockInvokeFullAccess` to the role if missing
 5. **Add/Replace Code**:
 ```python
-import json
-import boto3
+import json             # Used to work with JSON data (convert text to dictionary and vice versa)
+import boto3            # AWS SDK for Python to interact with AWS services
+import os               # Provides access to environment variables
+import urllib3          # Used to send HTTP requests (e.g., to Slack)
 
-# === Set up AWS service clients once (so we don’t redo it every time) ===
-# SNS client: used to send emails (notifications) via an SNS topic
+# === SETUP CONNECTIONS TO AWS SERVICES AND SLACK ===
+
+# Create a connection to Amazon SNS, which is used to send email or SMS alerts
 sns_client = boto3.client('sns')
-# Bedrock client: used to call the AI model (Anthropic Claude v2) for troubleshooting advice
+
+# Create a connection to Amazon Bedrock, a service that can generate AI-generated text (we use it for remediation advice)
 bedrock_client = boto3.client('bedrock-runtime', region_name="us-east-1")
 
-# === Configuration constants ===
-MODEL_ID = "anthropic.claude-v2"  # Which AI model to use
-# The SNS topic where CloudWatch alarms arrive and where we publish remediation emails
+# Create a connection for making HTTP POST requests (used to notify Slack)
+http = urllib3.PoolManager()
+
+# === SET FIXED SETTINGS FOR THE SCRIPT ===
+
+# The AI model we'll use (Claude v2 from Anthropic)
+MODEL_ID = "anthropic.claude-v2"
+
+# This is the ARN (Amazon Resource Name) of the SNS topic we'll send alerts to
 SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:657506130129:SmartOpsAlertTopic"
 
+# Slack Webhook URL is read from environment variables (kept secure and not hardcoded)
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
+# === MAIN FUNCTION THAT RUNS WHEN THE LAMBDA IS TRIGGERED ===
 def lambda_handler(event, context):
-    """
-    This Lambda function runs automatically whenever a CloudWatch alarm fires.
-    1. It reads the alarm details from the incoming event.
-    2. It asks Bedrock (the AI service) for troubleshooting steps plus AWS doc links.
-    3. It emails that advice back out via the same SNS topic.
-    """
-
-    # 1) Show the full event in the logs for debugging if something goes wrong
+    # Print the entire incoming event for debugging purposes (helps when troubleshooting)
     print("Received event:", json.dumps(event))
 
-    # 2) Pull out the actual alarm data from the SNS wrapper
-    try:
-        # event['Records'][0]['Sns']['Message'] is a JSON string of the alarm details
-        sns_msg = json.loads(event['Records'][0]['Sns']['Message'])
-    except Exception as e:
-        # If we can’t parse the alarm data, stop here and log the error
-        print("Error parsing SNS message:", str(e))
-        return {
-            'statusCode': 400,
-            'body': 'Invalid SNS message format'
-        }
+    # From the incoming event, extract the actual SNS message part
+    record = event['Records'][0]['Sns']
 
-    # 3) Extract the alarm name and the time it changed state
+    # Prevent the function from reacting to messages it created itself (avoids endless loops)
+    attrs = record.get('MessageAttributes', {})
+    if attrs.get('source', {}).get('StringValue') == 'remediation':
+        print("Skipping remediated notification to avoid loop.")
+        return {'statusCode': 200, 'body': 'Skipped remediation message'}
+
+    # Try to convert the SNS message from text to a Python dictionary
+    try:
+        sns_msg = json.loads(record['Message'])
+    except Exception as e:
+        # If it fails, print the error and original message, then stop execution
+        print("Error parsing SNS message:", str(e))
+        print("Raw message was:", record['Message'])
+        return {'statusCode': 400, 'body': 'Invalid SNS message format'}
+
+    # Extract useful details: alarm name and the time it triggered
     alarm_name = sns_msg.get('AlarmName', 'UnknownAlarm')
     timestamp = sns_msg.get('StateChangeTime', 'UnknownTime')
 
-    # 4) Build the text prompt we send to the AI model.
-    #    - It starts with "Human:" so Claude knows it’s our request.
-    #    - It ends with "Assistant:" so Claude knows where to put its answer.
-    #    - We explicitly ask for at least two official AWS docs URLs at the end.
+    # === CONSTRUCT THE QUESTION TO ASK THE AI ===
+    # We're pretending to be a user asking the AI for help resolving a high-CPU EC2 alarm
     prompt = (
         f"Human: EC2 Alarm '{alarm_name}' fired at {timestamp} due to CPU ≥ 75%.\n"
         "Provide a concise paragraph describing how to troubleshoot and resolve this issue. "
@@ -144,33 +154,36 @@ def lambda_handler(event, context):
         "Assistant:"
     )
 
-    # Pack our prompt into the format Bedrock expects
+    # Package the prompt and additional options into a format Bedrock expects
     bedrock_payload = json.dumps({
         "prompt": prompt,
-        "max_tokens_to_sample": 400,  # allow room for text + links
-        "temperature": 0.5            # 0.5 = balanced creativity
+        "max_tokens_to_sample": 400,  # Limit how much text the AI can return
+        "temperature": 0.5            # Controls creativity (0 = deterministic, 1 = very creative)
     })
 
-    # 5) Call the Bedrock AI service
+    # === CALL THE BEDROCK AI TO GET ADVICE ===
     try:
+        # Ask the AI model for help
         response = bedrock_client.invoke_model(
             modelId=MODEL_ID,
             contentType="application/json",
             accept="application/json",
             body=bedrock_payload
         )
-        # Read and parse the AI’s reply
+        # Read and parse the response
         body = json.loads(response["body"].read())
-        advice = body.get("completion", "No advice returned.")
+        advice = body.get("completion", "No advice returned.")  # Extract the AI's response
     except Exception as e:
-        # If the AI call fails, log and use a fallback message
+        # If something goes wrong, report it and use a fallback message
         print("Error invoking Bedrock:", str(e))
         advice = "Could not retrieve remediation advice from Bedrock."
 
-    # Log what we got back from the AI
+    # Print the AI's remediation advice to the logs for visibility
     print("Remediation advice + links:\n", advice)
 
-    # 6) Prepare the email subject and body
+    # === SEND THE ADVICE VIA EMAIL USING SNS ===
+
+    # Create the email subject and body
     subject = f"[Alert] EC2 Alarm: {alarm_name}"
     message = (
         f"The EC2 CloudWatch alarm '{alarm_name}' was triggered at {timestamp}.\n\n"
@@ -178,10 +191,8 @@ def lambda_handler(event, context):
         f"{advice}"
     )
 
-    # 7) Send the remediation email back out via SNS
-    #    We add a message attribute "source=remediation" so our Lambda won’t
-    #    accidentally re-trigger itself on this email.
     try:
+        # Send the email using SNS
         sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
             Subject=subject,
@@ -189,16 +200,40 @@ def lambda_handler(event, context):
             MessageAttributes={
                 "source": {
                     "DataType": "String",
-                    "StringValue": "remediation"
+                    "StringValue": "remediation"  # Mark this message as coming from remediation logic
                 }
             }
         )
-        print("Remediation advice + links sent via SNS.")
+        print("Remediation advice sent via SNS.")
     except Exception as e:
-        # If sending fails, log the error
+        # Log any issues when trying to send the email
         print("Error sending SNS message:", str(e))
 
-    # 8) Return success so AWS knows our Lambda ran fine
+    # === SEND THE SAME INFO TO SLACK (IF SET UP) ===
+    if SLACK_WEBHOOK_URL:
+        # Create the JSON message to send to Slack
+        slack_payload = {
+            "alarm_name": alarm_name,
+            "timestamp": timestamp,
+            "advice": advice
+        }
+        try:
+            # Use HTTP POST to send the message to the Slack Workflow
+            resp = http.request(
+                "POST",
+                SLACK_WEBHOOK_URL,
+                body=json.dumps(slack_payload).encode('utf-8'),
+                headers={"Content-Type": "application/json"}
+            )
+            print("Slack notification status:", resp.status)
+        except Exception as e:
+            # Log any error when trying to contact Slack
+            print("Error sending Slack message:", str(e))
+    else:
+        # Slack is optional – if it's not set up, just skip it
+        print("SLACK_WEBHOOK_URL not configured; skipping Slack notification.")
+
+    # === FINALLY, RETURN A SUCCESS RESPONSE BACK TO AWS ===
     return {
         'statusCode': 200,
         'body': json.dumps({'status': 'ok'})
