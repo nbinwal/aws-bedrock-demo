@@ -4,44 +4,39 @@ import os
 import re
 import time
 import urllib3
-from botocore.exceptions import ClientError  # For handling AWS API errors
+from botocore.exceptions import ClientError
 
 # === AWS & HTTP Clients ===
-# Creating clients to interact with AWS services and HTTP endpoints
-sns_client     = boto3.client('sns')                        # For publishing messages to SNS topics
-ssm_client     = boto3.client('ssm')                        # For sending commands to EC2 via Systems Manager
-bedrock_client = boto3.client('bedrock-runtime', region_name="us-east-1")  # For interacting with Amazon Bedrock (AI models)
-ec2_client     = boto3.client('ec2', region_name="us-east-1")              # For retrieving EC2 instance metadata
-http           = urllib3.PoolManager()                      # For making HTTP requests (used to validate URLs and call Slack webhook)
+sns_client     = boto3.client('sns')
+ssm_client     = boto3.client('ssm')
+bedrock_client = boto3.client('bedrock-runtime', region_name="us-east-1")
+ec2_client     = boto3.client('ec2', region_name="us-east-1")
+http           = urllib3.PoolManager()
 
 # === Configuration ===
-MODEL_ID          = "anthropic.claude-v2"                                      # Bedrock AI model to use
-SNS_TOPIC_ARN     = "arn:aws:sns:us-east-1:657506130129:SmartOpsAlertTopic"   # SNS topic for alert notifications
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")                       # Slack webhook from environment variable
-AWS_REGION        = ec2_client.meta.region_name                               # Current AWS region
+MODEL_ID          = "anthropic.claude-v2"
+SNS_TOPIC_ARN     = "arn:aws:sns:us-east-1:657506130129:SmartOpsAlertTopic"
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+AWS_REGION        = ec2_client.meta.region_name
 
-# === Lambda Entry Point ===
 def lambda_handler(event, context):
     record = event['Records'][0]['Sns']
-    
-    # Prevent this function from recursively triggering itself
     if record.get('MessageAttributes', {}).get('source', {}).get('StringValue') == 'remediation':
         return {'statusCode': 200, 'body': 'skipped'}
 
-    # Parse the alarm message sent by CloudWatch via SNS
     sns_msg    = json.loads(record['Message'])
     alarm_name = sns_msg.get('AlarmName', 'UnknownAlarm')
     timestamp  = sns_msg.get('StateChangeTime', 'UnknownTime')
 
-    # === Extract the EC2 Instance ID from alarm trigger dimensions ===
+    # Extract InstanceId
     instance_id = None
-    trigger = sns_msg.get('Trigger', {}) or sns_msg.get('trigger', {})  # Allow both keys for compatibility
-    for d in trigger.get('Dimensions', trigger.get('dimensions', [])):  # Check both capitalized and lowercase keys
+    trigger = sns_msg.get('Trigger', {}) or sns_msg.get('trigger', {})
+    for d in trigger.get('Dimensions', trigger.get('dimensions', [])):
         if (d.get('Name') or d.get('name')) == 'InstanceId':
             instance_id = d.get('Value') or d.get('value')
             break
 
-    # === 1) Fetch EC2 instance metadata (like name, IP, etc.) ===
+    # ==== 1) Fetch EC2 metadata ====
     if instance_id:
         resp = ec2_client.describe_instances(InstanceIds=[instance_id])
         inst = resp['Reservations'][0]['Instances'][0]
@@ -53,7 +48,6 @@ def lambda_handler(event, context):
         priv_ip    = inst.get('PrivateIpAddress', 'N/A')
         pub_ip     = inst.get('PublicIpAddress', 'N/A')
 
-        # Build a nicely formatted string with instance details
         resource_details = (
             f"Name: {name_tag}\n"
             f"InstanceId: {instance_id}\n"
@@ -65,7 +59,6 @@ def lambda_handler(event, context):
             f"Public IP: {pub_ip}"
         )
 
-        # Construct a link to the CloudWatch dashboard for this instance's CPU usage
         cpu_metrics_url = (
             f"https://{AWS_REGION}.console.aws.amazon.com/cloudwatch/home"
             f"?region={AWS_REGION}#resource-health:dashboards/ec2/{instance_id}"
@@ -75,11 +68,11 @@ def lambda_handler(event, context):
         resource_details = "No EC2 instance ID found in alarm."
         cpu_metrics_url = "N/A"
 
-    # === 2) (Optional) Fetch top CPU-consuming processes using SSM RunCommand ===
+    # ==== 2) Fetch top 5 CPU processes via SSM ====
     top_processes = "Not available"
+    top_process_name = "Unknown"
     if instance_id:
         try:
-            # Send command to instance to list top 5 CPU-consuming processes
             cmd = ssm_client.send_command(
                 InstanceIds=[instance_id],
                 DocumentName="AWS-RunShellScript",
@@ -87,12 +80,11 @@ def lambda_handler(event, context):
                 TimeoutSeconds=30
             )
             cmd_id = cmd["Command"]["CommandId"]
-            
-            # === Retry logic to handle potential delays in SSM command availability ===
+
             max_retries = 8
             retry_delay = 2
             inv = None
-            
+
             for attempt in range(max_retries):
                 try:
                     inv = ssm_client.get_command_invocation(
@@ -112,11 +104,17 @@ def lambda_handler(event, context):
                     else:
                         raise
                 time.sleep(retry_delay)
-            # === End of retry ===
 
-            # Save command output if successful
             if inv and inv["Status"] == "Success":
                 top_processes = inv["StandardOutputContent"].strip()
+
+                # Extract top process name from second line
+                lines = top_processes.splitlines()
+                if len(lines) >= 2:
+                    first_proc_line = lines[1].strip()
+                    parts = first_proc_line.split()
+                    if len(parts) >= 2:
+                        top_process_name = parts[1]
             elif inv:
                 top_processes = f"SSM command status: {inv['Status']}"
             else:
@@ -124,11 +122,13 @@ def lambda_handler(event, context):
         except Exception as e:
             top_processes = f"Error fetching processes via SSM: {e}"
 
-    # === 3) Ask Amazon Bedrock (Claude model) for troubleshooting advice ===
+    # ==== 3) Ask Bedrock for advice ====
     prompt = (
         f"Human: A CloudWatch alarm '{alarm_name}' for EC2 instance {instance_id or 'Unknown'} "
         f"fired at {timestamp} due to high CPU usage.\n\n"
-        "Provide a concise troubleshooting and remediation plan for a cloud engineer. "
+        f"The top process consuming CPU is: '{top_process_name}'.\n"
+        f"Here are the top 5 CPU-consuming processes:\n{top_processes}\n\n"
+        "Please analyze why this process might cause high CPU and provide a concise troubleshooting and remediation plan for a cloud engineer. "
         "Then list 3–5 official AWS documentation URLs (one per line).\n"
         "Assistant:"
     )
@@ -137,31 +137,34 @@ def lambda_handler(event, context):
             modelId=MODEL_ID,
             contentType="application/json",
             accept="application/json",
-            body=json.dumps({"prompt": prompt, "max_tokens_to_sample": 400, "temperature": 0.5})
+            body=json.dumps({
+                "prompt": prompt,
+                "max_tokens_to_sample": 400,
+                "temperature": 0.5
+            })
         )
         advice = json.loads(resp["body"].read()).get("completion", "").strip()
     except Exception:
         advice = "Could not retrieve remediation advice from Bedrock."
 
-    # === 4) Validate the AWS doc URLs returned by Bedrock ===
+    # ==== 4) Validate AWS doc links ====
     urls = re.findall(r'https?://(?:docs\.aws\.amazon\.com|aws\.amazon\.com)/\S+', advice)
     valid_urls = []
     for u in urls:
         try:
-            r = http.request("HEAD", u, timeout=5.0)  # Fast check without downloading the full page
+            r = http.request("HEAD", u, timeout=5.0)
             if 200 <= r.status < 400:
                 valid_urls.append(u)
         except:
             pass
 
-    # Clean up the advice text and append validated URLs
     if valid_urls:
         advice_text = advice.split(valid_urls[0])[0].strip()
         advice_text += "\n\nAWS Documentation Links:\n" + "\n".join(valid_urls)
     else:
         advice_text = advice
 
-    # === 5) Send a structured alert email via SNS ===
+    # ==== 5) Send SNS email ====
     subject = f"[Alert] EC2 Alarm: {alarm_name}"
     message = (
         f"Alarm: {alarm_name}\n"
@@ -178,7 +181,7 @@ def lambda_handler(event, context):
         MessageAttributes={"source": {"DataType":"String","StringValue":"remediation"}}
     )
 
-    # === 6) Send the same message as a Slack webhook notification ===
+    # ==== 6) Send to Slack ====
     if SLACK_WEBHOOK_URL:
         slack_payload = {
             "alarm_name":       alarm_name,
@@ -195,5 +198,4 @@ def lambda_handler(event, context):
             headers={"Content-Type": "application/json"}
         )
 
-    # === Lambda response ===
     return {'statusCode': 200, 'body': json.dumps({'status': 'ok'})}
