@@ -28,6 +28,11 @@ def lambda_handler(event, context):
     alarm_name = sns_msg.get('AlarmName', 'UnknownAlarm')
     timestamp  = sns_msg.get('StateChangeTime', 'UnknownTime')
 
+    # Determine alarm type (CPU or Memory)
+    alarm_type = 'cpu'
+    if 'memory' in alarm_name.lower():
+        alarm_type = 'memory'
+
     # Extract InstanceId
     instance_id = None
     trigger = sns_msg.get('Trigger', {}) or sns_msg.get('trigger', {})
@@ -59,24 +64,29 @@ def lambda_handler(event, context):
             f"Public IP: {pub_ip}"
         )
 
-        cpu_metrics_url = (
+        metrics_url = (
             f"https://{AWS_REGION}.console.aws.amazon.com/cloudwatch/home"
-            f"?region={AWS_REGION}#resource-health:dashboards/ec2/{instance_id}"
-            f"?~(leadingMetric~'*22cpu-utilization*22)"
+            f"?region={AWS_REGION}#resource-health:dashboards/ec2/{instance_id}?"
+            f"~(leadingMetric~'*22{alarm_type}-utilization*22)"
         )
     else:
         resource_details = "No EC2 instance ID found in alarm."
-        cpu_metrics_url = "N/A"
+        metrics_url = "N/A"
 
-    # ==== 2) Fetch top 5 CPU processes via SSM ====
+    # ==== 2) Fetch top 5 Processes via SSM ====
     top_processes = "Not available"
     top_process_name = "Unknown"
     if instance_id:
         try:
+            if alarm_type == "cpu":
+                shell_cmd = "ps -eo pid,comm,%cpu --sort=-%cpu | head -n6"
+            else:
+                shell_cmd = "ps -eo pid,comm,%mem --sort=-%mem | head -n6"
+
             cmd = ssm_client.send_command(
                 InstanceIds=[instance_id],
                 DocumentName="AWS-RunShellScript",
-                Parameters={"commands": ["ps -eo pid,comm,%cpu --sort=-%cpu | head -n6"]},
+                Parameters={"commands": [shell_cmd]},
                 TimeoutSeconds=30
             )
             cmd_id = cmd["Command"]["CommandId"]
@@ -95,20 +105,14 @@ def lambda_handler(event, context):
                         break
                 except ClientError as error:
                     if error.response['Error']['Code'] == 'InvocationDoesNotExist':
-                        if attempt < max_retries - 1:
-                            time.sleep(retry_delay)
-                            continue
-                        else:
-                            top_processes = "SSM command timed out: Invocation not available after retries"
-                            break
+                        time.sleep(retry_delay)
+                        continue
                     else:
                         raise
                 time.sleep(retry_delay)
 
             if inv and inv["Status"] == "Success":
                 top_processes = inv["StandardOutputContent"].strip()
-
-                # Extract top process name from second line
                 lines = top_processes.splitlines()
                 if len(lines) >= 2:
                     first_proc_line = lines[1].strip()
@@ -123,13 +127,14 @@ def lambda_handler(event, context):
             top_processes = f"Error fetching processes via SSM: {e}"
 
     # ==== 3) Ask Bedrock for advice ====
+    metric_unit = "%CPU" if alarm_type == "cpu" else "%MEM"
     prompt = (
         f"Human: A CloudWatch alarm '{alarm_name}' for EC2 instance {instance_id or 'Unknown'} "
-        f"fired at {timestamp} due to high CPU usage.\n\n"
-        f"The top process consuming CPU is: '{top_process_name}'.\n"
-        f"Here are the top 5 CPU-consuming processes:\n{top_processes}\n\n"
-        "Please analyze why this process might cause high CPU and provide a concise troubleshooting and remediation plan for a cloud engineer. "
-        "Then list 3–5 official AWS documentation URLs (one per line).\n"
+        f"fired at {timestamp} due to high {alarm_type.upper()} usage.\n\n"
+        f"The top process consuming {metric_unit} is: '{top_process_name}'.\n"
+        f"Here are the top 5 processes by {metric_unit}:\n{top_processes}\n\n"
+        f"Please analyze why this process might cause high {alarm_type.upper()} and provide a concise troubleshooting and remediation plan for a cloud engineer. "
+        f"Then list 3–5 official AWS documentation URLs (one per line).\n"
         "Assistant:"
     )
     try:
@@ -170,8 +175,8 @@ def lambda_handler(event, context):
         f"Alarm: {alarm_name}\n"
         f"Time: {timestamp}\n\n"
         f"Resource Details:\n{resource_details}\n\n"
-        f"CloudWatch CPU Metrics URL:\n{cpu_metrics_url}\n\n"
-        f"Top CPU Processes:\n{top_processes}\n\n"
+        f"CloudWatch {alarm_type.upper()} Metrics URL:\n{metrics_url}\n\n"
+        f"Top 5 {alarm_type.upper()} Processes:\n{top_processes}\n\n"
         f"Remediation Advice:\n{advice_text}"
     )
     sns_client.publish(
@@ -187,7 +192,7 @@ def lambda_handler(event, context):
             "alarm_name":       alarm_name,
             "timestamp":        timestamp,
             "resource_details": resource_details,
-            "cpu_metrics_url":  cpu_metrics_url,
+            "cpu_metrics_url":  metrics_url,
             "top_processes":    top_processes,
             "advice":           advice_text
         }
