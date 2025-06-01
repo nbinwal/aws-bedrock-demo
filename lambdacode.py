@@ -4,7 +4,6 @@ import os
 import re
 import time
 import urllib3
-import logging
 from botocore.exceptions import ClientError
 
 # === AWS & HTTP Clients ===
@@ -16,17 +15,15 @@ http           = urllib3.PoolManager()
 
 # === Configuration ===
 MODEL_ID          = "anthropic.claude-v2"
-# Use your SNS topic ARN here (the same one that triggers this Lambda):
+# This is the SNS Topic ARN where CloudWatch publishes JSON alarm payloads.
 SNS_TOPIC_ARN     = "arn:aws:sns:us-east-1:657506130129:SmartOpsAlertTopic"
-# Slack webhook must still be set in Lambda environment variables:
+# Set this environment variable in Lambda to your Slack Incoming Webhook URL
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 AWS_REGION        = ec2_client.meta.region_name
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
 
 def is_json(s: str) -> bool:
+    """Return True if the string s is valid JSON."""
     try:
         json.loads(s)
         return True
@@ -36,62 +33,54 @@ def is_json(s: str) -> bool:
 
 def lambda_handler(event, context):
     """
-    This Lambda receives:
-      • CloudWatch Alarm → SNS (JSON payload)
-      • Our own “plaintext + AI advice” SNS publish (to deliver to Slack & Outlook)
+    1) CloudWatch Alarm → SNS (JSON) → Lambda  
+       → JSON‐path: gather metadata, call Bedrock, execute SSM, defer reboot, republish plaintext (source=remediation), then send Slack.
 
-    Flow:
-      1. Grab record = event['Records'][0]['Sns']
-      2. If MessageAttributes.source == "remediation": SKIP (avoid loops)
-      3. If raw_msg is JSON → run Bedrock + SSM + actions + re-publish plaintext→SNS
-      4. If raw_msg starts with "Alarm:" → parse fields → send to Slack and send to SNS for Outlook
-      5. Otherwise skip unknown formats
+    2) SNS (plaintext w/ source=remediation) → Lambda  
+       → Plaintext‐path: extract exactly nine fields, send Slack, re‐publish the same plaintext (so Outlook still gets email).
+
+    3) Any message with MessageAttributes.source == "remediation" is skipped at the top to avoid loops.
     """
-    record = event['Records'][0]['Sns']
+
+    record  = event['Records'][0]['Sns']
     raw_msg = record.get('Message', "")
 
-    # === 0) Avoid recursive loops: if we ourselves published with source="remediation", skip ===
+    # === 0) Prevent any message we ourselves published with source=remediation from re‐processing ===
     source_attr = record.get('MessageAttributes', {}) \
                         .get('source', {}) \
                         .get('StringValue')
     if source_attr == "remediation":
-        logger.info("[SKIP] Received our own remediation publish; skipping.")
         return {'statusCode': 200, 'body': 'skipped'}
 
-    # === 1) If the SNS message is valid JSON → treat as CloudWatch alarm ===
+    # === 1) If the SNS message is valid JSON → JSON‐path ===
     if is_json(raw_msg):
-        logger.info("[INFO] Received JSON alarm payload → starting agentic AI flow.")
-
-        try:
-            sns_msg    = json.loads(raw_msg)
-        except Exception as e:
-            logger.error(f"[ERROR] Failed to parse SNS JSON: {str(e)}; skipping.")
-            return {'statusCode': 400, 'body': 'invalid JSON'}
-
+        #############################
+        # ----- JSON Path Start -----
+        #############################
+        sns_msg    = json.loads(raw_msg)
         alarm_name = sns_msg.get('AlarmName', 'UnknownAlarm')
         timestamp  = sns_msg.get('StateChangeTime', 'UnknownTime')
 
-        # Determine if CPU or Memory alarm
+        # Determine if this is a CPU or Memory alarm
         alarm_type = 'cpu'
         if 'memory' in alarm_name.lower():
             alarm_type = 'memory'
 
-        # Extract InstanceId
+        # Extract the EC2 InstanceId from the Alarm details
         instance_id = None
-        trigger = sns_msg.get('Trigger', {}) or sns_msg.get('trigger', {})
+        trigger     = sns_msg.get('Trigger', {}) or sns_msg.get('trigger', {})
         for d in trigger.get('Dimensions', trigger.get('dimensions', [])):
             dim_name = d.get('Name') or d.get('name')
             if dim_name == 'InstanceId':
                 instance_id = d.get('Value') or d.get('value')
                 break
 
-        # ==== 1) Fetch EC2 metadata ====
+        # ==== A) Fetch EC2 metadata ====
         if instance_id:
             try:
                 resp = ec2_client.describe_instances(InstanceIds=[instance_id])
                 inst = resp['Reservations'][0]['Instances'][0]
-            except Exception as e:
-                logger.error(f"[ERROR] Failed to describe_instances: {e}")
+            except Exception:
                 inst = {}
 
             name_tag   = next((t['Value'] for t in inst.get('Tags', []) if t['Key']=='Name'), 'N/A')
@@ -122,7 +111,7 @@ def lambda_handler(event, context):
             resource_details = "No EC2 instance ID found in alarm."
             metrics_url      = "N/A"
 
-        # ==== 2) Fetch top 5 Processes via SSM ====
+        # ==== B) Fetch top 5 processes via SSM ====
         top_processes    = "Not available"
         top_process_name = "Unknown"
         if instance_id:
@@ -143,7 +132,6 @@ def lambda_handler(event, context):
                 max_retries = 8
                 retry_delay = 2
                 inv = None
-
                 for attempt in range(max_retries):
                     try:
                         inv = ssm_client.get_command_invocation(
@@ -175,7 +163,7 @@ def lambda_handler(event, context):
             except Exception as e:
                 top_processes = f"Error fetching processes via SSM: {e}"
 
-        # ==== 3) Ask Bedrock for advice (with explicit markers) ====
+        # ==== C) Ask Bedrock with explicit ###ADVICE### and ###PLAN### markers ====
         metric_unit = "%CPU" if alarm_type == "cpu" else "%MEM"
         prompt = (
             f"Human: A CloudWatch alarm '{alarm_name}' for EC2 instance {instance_id or 'Unknown'} "
@@ -209,7 +197,7 @@ def lambda_handler(event, context):
         except Exception:
             raw = "###ADVICE###\nBedrock unavailable; defaulting to kill top process.\n\n###PLAN###\n{}"
 
-        # ==== 3.a) If Claude returns {"type":"completion","completion":"…"}, unwrap that ====
+        # ==== C1) Some models return {"type":"completion","completion":"…"}:
         try:
             maybe_obj = json.loads(raw)
             if isinstance(maybe_obj, dict) and "completion" in maybe_obj:
@@ -217,7 +205,7 @@ def lambda_handler(event, context):
         except:
             pass
 
-        # ==== 4) Split on markers (“###ADVICE###” / “###PLAN###”) ====
+        # ==== D) Split “raw” into advice_main vs. plan_obj ====
         advice_main = ""
         plan_obj    = {}
         if "###ADVICE###" in raw and "###PLAN###" in raw:
@@ -233,13 +221,13 @@ def lambda_handler(event, context):
             advice_main = raw
             plan_obj    = {}
 
-        # ==== 5) If plan_obj has no "actions", auto-generate fallback: kill top process ====
+        # ==== E) Fallback if plan_obj lacks "actions" ====
         if not plan_obj.get("actions"):
             if top_process_name and top_process_name != "Unknown":
                 plan_obj["actions"] = [{
-                    "type": "ssm_command",
+                    "type":        "ssm_command",
                     "description": f"Kill top process '{top_process_name}' to reduce load",
-                    "commands": [f"sudo pkill -9 {top_process_name}"]
+                    "commands":    [f"sudo pkill -9 {top_process_name}"]
                 }]
                 plan_obj["justifications"] = [
                     f"Killing '{top_process_name}' will immediately reduce CPU/Memory usage."
@@ -248,19 +236,19 @@ def lambda_handler(event, context):
                 plan_obj["actions"]        = []
                 plan_obj["justifications"] = []
 
-        # ==== 6) Execute SSM actions, deferring any reboot ====
+        # ==== F) Execute SSM actions, deferring any reboot commands ====
         executed_actions = []
         justifications   = plan_obj.get("justifications", [])
         deferred_reboot  = None
 
         for idx, action in enumerate(plan_obj.get("actions", [])):
             if action.get("type") == "ssm_command" and instance_id:
-                cmd_list     = action.get("commands", [])
-                description  = action.get("description", "")
-                justification= justifications[idx] if idx < len(justifications) else ""
+                cmd_list      = action.get("commands", [])
+                description   = action.get("description", "")
+                justification = justifications[idx] if idx < len(justifications) else ""
 
-                # Defer “reboot” commands to step 10
-                if any("reboot" in c for c in cmd_list):
+                # 1) If any command line contains "reboot", defer it
+                if any("reboot" in c.lower() for c in cmd_list):
                     deferred_reboot = {
                         "description":   description,
                         "commands":      cmd_list,
@@ -268,7 +256,7 @@ def lambda_handler(event, context):
                     }
                     continue
 
-                # If agent returned “grep stress” / “kill <stress_pid>”, convert to pkill
+                # 2) If the plan says "grep stress" or "kill <stress_pid>", convert to "sudo pkill -9 <top_process_name>"
                 final_cmds = []
                 for c in cmd_list:
                     if "<stress_pid>" in c or "grep stress" in c:
@@ -300,7 +288,7 @@ def lambda_handler(event, context):
                         "justification": justification
                     })
 
-        # ==== 7) Scrub AWS doc links out of advice_main, append at end ====
+        # ==== G) Scrub any AWS doc links out of advice_main, append at end ====
         urls       = re.findall(r'https?://(?:docs\.aws\.amazon\.com|aws\.amazon\.com)/\S+', advice_main)
         valid_urls = []
         for u in urls:
@@ -310,12 +298,11 @@ def lambda_handler(event, context):
                     valid_urls.append(u)
             except:
                 pass
-
         if valid_urls:
             advice_main = advice_main.split(valid_urls[0])[0].strip()
             advice_main += "\n\nAWS Documentation Links:\n" + "\n".join(valid_urls)
 
-        # ==== 8) Build & send SNS email (for Outlook) ====
+        # ==== H) Build & re‐publish Plaintext to SNS for Outlook (with source=remediation) ====
         subject         = f"[Alert] EC2 Alarm: {alarm_name}"
         metrics_label   = f"{alarm_type.upper()} Metrics Console"
         processes_label = f"Top 5 {alarm_type.upper()} Processes"
@@ -348,149 +335,119 @@ def lambda_handler(event, context):
             f"{executed_summary}"
         )
 
-        # Publish plaintext with source="remediation" so step 14 can pick it up
+        # Publish plaintext back to SNS so Outlook gets notified (source=remediation)
         sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
             Subject=subject,
             Message=message_body,
-            MessageAttributes={
-                "source": { "DataType":"String", "StringValue":"remediation" }
-            }
+            MessageAttributes={"source": {"DataType":"String", "StringValue":"remediation"}}
         )
-        logger.info("[INFO] Published enriched plaintext for Slack & email.")
 
-        # ==== 9) Send to Slack (with actions_taken array) ====
+        # ==== I) Send to Slack (exactly nine fields) ====
         if SLACK_WEBHOOK_URL:
-            try:
-                actions_list = []
-                for action in executed_actions:
-                    actions_list.append({
-                        "description":   action['description'],
-                        "commands":      action['commands'],
-                        "status":        action.get('status', 'SENT'),
-                        "justification": action.get('justification', '')
-                    })
+            # Build a multi‐line string for “actions_taken”
+            if executed_actions:
+                actions_taken_lines = []
+                for x in executed_actions:
+                    actions_taken_lines.append(
+                        f"- Description: {x['description']}\n"
+                        f"  Commands: {x['commands']}\n"
+                        f"  Status: {x['status']}\n"
+                        f"  Justification: {x.get('justification','')}"
+                    )
                 if deferred_reboot:
-                    actions_list.append({
-                        "description":   deferred_reboot['description'],
-                        "commands":      deferred_reboot['commands'],
-                        "status":        "PENDING REBOOT",
-                        "justification": deferred_reboot['justification']
-                    })
+                    actions_taken_lines.append(
+                        f"- Description: {deferred_reboot['description']}\n"
+                        f"  Commands: {deferred_reboot['commands']}\n"
+                        "  Status: PENDING REBOOT\n"
+                        f"  Justification: {deferred_reboot['justification']}"
+                    )
+                actions_taken_str = "\n\n".join(actions_taken_lines)
+            else:
+                actions_taken_str = "No automated actions were taken."
 
-                slack_payload = {
-                    "alarm_name":       alarm_name,
-                    "timestamp":        timestamp,
-                    "resource_details": resource_details,
-                    "metrics_type":     "CPU" if alarm_type == "cpu" else "Memory",
-                    "metrics_url":      metrics_url,
-                    "top_processes":    top_processes,
-                    "advice":           advice_main,
-                    "actions_taken":    actions_list
-                }
+            slack_payload = {
+                "alarm_name":       alarm_name,
+                "timestamp":        timestamp,
+                "resource_details": resource_details,
+                "metrics_type":     alarm_type.upper(),
+                "metrics_url":      metrics_url,
+                "processes_type":   alarm_type.upper(),   # NEW: exactly as you requested
+                "top_processes":    top_processes,
+                "advice":           advice_main,
+                "actions_taken":    actions_taken_str
+            }
 
-                # For debugging: log the payload
-                logger.info("Slack payload →")
-                logger.info(json.dumps(slack_payload, indent=2))
-
-                # Try up to 2 retries
-                max_retries = 2
-                for attempt in range(max_retries + 1):
-                    try:
-                        response = http.request(
-                            "POST",
-                            SLACK_WEBHOOK_URL,
-                            body=json.dumps(slack_payload).encode("utf-8"),
-                            headers={"Content-Type": "application/json"}
-                        )
-                        logger.info(f"Slack HTTP status: {response.status}")
-                        if response.status == 200:
-                            break
-                    except Exception as e:
-                        logger.warning(f"Slack send attempt {attempt} failed: {str(e)}")
-                    if attempt < max_retries:
-                        time.sleep(2 ** attempt)
-            except Exception as e:
-                logger.error(f"[ERROR] Slack notification failed: {str(e)}")
-
-        # ==== 10) Finally, if we deferred a reboot, send it now ====
-        if deferred_reboot and instance_id:
-            try:
-                reboot_resp = ssm_client.send_command(
-                    InstanceIds=[instance_id],
-                    DocumentName="AWS-RunShellScript",
-                    Parameters={"commands": deferred_reboot["commands"]},
-                    TimeoutSeconds=60
-                )
-                reboot_cmd_id = reboot_resp["Command"]["CommandId"]
-                executed_actions.append({
-                    "description":   deferred_reboot['description'],
-                    "commands":      deferred_reboot['commands'],
-                    "command_id":    reboot_cmd_id,
-                    "status":        "SENT (REBOOT)",
-                    "justification": deferred_reboot['justification']
-                })
-            except ClientError as e:
-                executed_actions.append({
-                    "description":   deferred_reboot['description'],
-                    "commands":      deferred_reboot['commands'],
-                    "status":        f"REBOOT FAILED: {str(e)}",
-                    "justification": deferred_reboot['justification']
-                })
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                try:
+                    response = http.request(
+                        "POST",
+                        SLACK_WEBHOOK_URL,
+                        body=json.dumps(slack_payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    if response.status == 200:
+                        break
+                except:
+                    time.sleep(2 ** attempt)
 
         return {'statusCode': 200, 'body': json.dumps({'status': 'ok'})}
 
-    # === 2) If it’s not JSON, but starts “Alarm:”, treat as our enriched plaintext ===
+    # === 2) If SNS message is not JSON but starts with “Alarm:”, treat as plaintext path ===
     if raw_msg.startswith("Alarm:"):
-        logger.info("[INFO] Plaintext enriched message detected → send to Slack and re-publish for Outlook.")
-
-        # Helper to extract multi-line blocks by label
+        ###############################
+        # ----- Plaintext Path Start -----
+        ###############################
+        # Extract blocks by looking for “Label:” followed by newline, grabbing until next label
         def extract_block(label):
-            pattern = rf"{label}:\n(.*?)(?=\n[A-Z][^\n]+:|\Z)"
+            pattern = rf"{label}:\n(.*?)(?=\n[A-Z][^:]+:|\Z)"
             m = re.search(pattern, raw_msg, re.DOTALL)
             return m.group(1).strip() if m else "Not available"
 
         alarm_name       = re.search(r"Alarm:\s*(.+)", raw_msg).group(1).strip()
         timestamp        = re.search(r"Time:\s*(.+)", raw_msg).group(1).strip()
         resource_details = extract_block("Resource Details")
+        # Metrics Console could be “CPU Metrics Console” or “Memory Metrics Console”
         metrics_url      = extract_block("CPU Metrics Console") or extract_block("Memory Metrics Console")
         top_processes    = extract_block("Top 5 CPU Processes") or extract_block("Top 5 Memory Processes")
         advice_text      = extract_block("Human Advice")
         actions_taken    = extract_block("=== Actions Taken by AI ===")
 
-        # ----- Send to Slack -----
+        # 2a) Send exactly those nine variables to Slack
         if SLACK_WEBHOOK_URL:
+            # Determine processes_type based on which label was present in raw_msg
+            processes_type = "CPU" if "Top 5 CPU Processes" in raw_msg else "Memory"
             slack_payload = {
                 "alarm_name":       alarm_name,
                 "timestamp":        timestamp,
                 "resource_details": resource_details,
+                "metrics_type":     processes_type,
                 "metrics_url":      metrics_url,
+                "processes_type":   processes_type,
                 "top_processes":    top_processes,
                 "advice":           advice_text,
                 "actions_taken":    actions_taken
             }
             try:
-                response = http.request(
+                _ = http.request(
                     "POST",
                     SLACK_WEBHOOK_URL,
                     body=json.dumps(slack_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                logger.info(f"Slack HTTP status: {response.status}")
-                if response.status != 200:
-                    logger.warning(f"Slack response body: {response.data.decode('utf-8')}")
-            except Exception as e:
-                logger.error(f"[ERROR] Slack notification failed: {str(e)}")
+            except:
+                pass
 
-        # ----- Re-publish for Outlook (with source="remediation") -----
+        # 2b) Re‐publish the same plaintext to SNS with source=remediation so Outlook still gets it
         sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
             Subject=f"[Alert] EC2 Alarm: {alarm_name}",
             Message=raw_msg,
             MessageAttributes={"source": {"DataType":"String", "StringValue":"remediation"}}
         )
+
         return {'statusCode': 200, 'body': 'Slack + email sent'}
 
-    # === 3) If we reach here, message format is unexpected ===
-    logger.warning("[WARN] Unrecognized SNS message format; skipping.")
+    # === 3) Otherwise skip unknown format ===
     return {'statusCode': 200, 'body': 'skipped unknown format'}
