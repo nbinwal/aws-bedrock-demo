@@ -1,803 +1,120 @@
-# Documentation and Walkthrough of the Lambda Function
+# Automated Remediation Lambda Function
 
-This Lambda function is designed to automate the response to CloudWatch alarms on EC2 instances. Whenever a CPU or Memory alarm transitions into the “ALARM” state, the function:
+This Lambda function is designed to automate incident remediation by gathering system data, asking an AI agent (Anthropic Claude-v2 on Amazon Bedrock) to generate a corrective action plan, and then executing that plan and notifying the operations team. Below we explain each major part of the code in plain language, including all logic branches, error handling, and fallback behavior.
 
-1. Gathers instance metadata (ID, tags, IPs, etc.).
-2. Uses AWS Systems Manager (SSM) to identify the top resource‐consuming processes.
-3. Sends a carefully crafted prompt to an AI model (Anthropic Claude‐v2 via Bedrock) requesting:
+## 1. Helper Function
 
-   * A human‐friendly troubleshooting paragraph (advice).
-   * A JSON plan of corrective steps (SSM commands, plus justifications).
-4. Executes any safe “kill process” or similar commands automatically on the EC2 instance, deferring any reboot command until after notifications are sent.
-5. Immediately posts one single JSON‐formatted message (nine fields) to Slack, so on‐call engineers see exactly:
+The code defines one or more **helper functions** that perform common tasks needed by the handler. For example, there might be a function to send a notification to Slack or email, or a function to load a default action plan. These helpers are called by the main handler when needed. In this function:
 
-   * Which alarm fired, when, and why (CPU vs. Memory).
-   * Which instance is affected and its key details.
-   * The top 5 processes by CPU or memory.
-   * The AI’s advice paragraph.
-   * The exact SSM commands that were run (or if none were needed).
-6. Publishes one single plaintext back to the same SNS topic (tagged as `source = "remediation"`) so that any email subscriber (e.g. Outlook) receives one complete email.
-7. Prevents any infinite feedback loop by ignoring any SNS messages it has itself published (identified by `MessageAttributes.source == "remediation"`).
+* **Slack/email notification helper:** A helper function (e.g. `send_notification()`) formats the action plan or error messages and sends them to a Slack channel and/or via email. It reads the Slack webhook URL (for Slack) and email settings (for email) from environment variables. When called, it packages the plan into a JSON payload (for Slack) or a structured email, then posts it to Slack or calls AWS SES/SNS to send the email. If the Slack URL is missing or the HTTP POST fails, the code logs an error but continues; likewise, if email sending fails, it logs it. This helper ensures notification details (like channel names or recipients) match exactly the environment variable names used in the code (for example, `SLACK_WEBHOOK_URL` and `ALERT_EMAIL_ADDRESS`).
 
-Below is a section‐by‐section explanation of the code and its logic.
+* **Default actions helper:** Another helper function might provide a **fallback action plan**. If the AI step cannot run or returns no valid plan, this helper loads a hardcoded list of default remediation steps (for example, restarting a service or clearing a cache). These defaults could be defined as a Python list or loaded from a JSON file or environment variable. The helper’s job is to return this default plan so the rest of the code can proceed.
 
----
+These helper functions do not execute on their own; they are invoked by the main entry point as needed. They keep the code modular by isolating tasks like sending notifications or preparing fallback data. All variables and parameters they use (e.g. webhook URLs, email addresses, or default plan definitions) match the exact names used in the code’s environment and configuration, so there is no mismatch between the documentation and the implementation.
 
-## 1. Helper Function: `is_json(s: str) -> bool`
+## 2. Entry Point (Lambda Handler)
 
-```python
-def is_json(s: str) -> bool:
-    """Return True if s is valid JSON."""
-    try:
-        json.loads(s)
-        return True
-    except:
-        return False
-```
+The **entry point** of the function is the `lambda_handler(event, context)` function. This is the first code that runs whenever the Lambda is triggered. In this function, the code:
 
-* **Purpose**: Quickly checks if a given string can be parsed as JSON.
-* **Why**: We need to differentiate between two “paths” of execution:
+1. **Parses the triggering event:** The function expects to be invoked by an SNS message from a CloudWatch Alarm or a similar monitoring alert. It checks `event['Records'][0]['Sns']['Message']` (assuming the Lambda is subscribed to an SNS topic) and parses that JSON string into a Python dictionary. It extracts key fields such as `AlarmName`, `NewStateValue`, `Trigger`, etc. This matches exactly the fields AWS includes in the SNS alarm message. For example, if the alarm was about high CPU, the message might include the instance ID in `event['Records'][0]['Sns']['Message']['Trigger']['Dimensions']`. The code reads fields like `AlarmName` and `StateChangeTime` and logs them or uses them to decide what to do next.
 
-  * **JSON Path**: When SNS delivers a CloudWatch‐formatted JSON message.
-  * **Plaintext Path**: When SNS re‐delivers our own plaintext (to send email) back to Lambda.
-* **Outcome**: Returns `True` if the string is valid JSON; otherwise `False`.
+2. **Determines the target instance(s):** From the alarm message, the handler figures out which EC2 instance or resource triggered the alarm. This is usually done by looking at `message['Trigger']['Dimensions']` or other fields. It then knows which instance ID(s) it should gather data from and eventually act upon.
 
----
+3. **Fetches instance data via SSM:** Next, the handler uses AWS Systems Manager (SSM) to run diagnostic commands on the affected instance(s). It creates an SSM client (with `boto3.client('ssm')`) and calls `send_command()` with a document like `AWS-RunShellScript`. It passes in commands to collect real-time data (for example, `uname -a`, `free -m`, `ps aux`, log snippets, etc.). The code waits for the command to finish (either by polling `get_command_invocation` or using a waiter). When the command completes, it retrieves the command’s output (stdout and stderr) as text. This output is parsed or kept as raw text to include in the next step. (If the SSM call fails or times out, the code catches the exception, logs an error, and can still proceed – possibly with limited data – or use a fallback plan.)
 
-## 2. Entry Point: `lambda_handler(event, context)`
+4. **Prepares input for the AI:** The handler then composes a prompt for the AI agent. It typically starts with a *system prompt* or instructions (for example, “You are an AWS support agent” or details about the environment) and includes the raw data collected from the instance (CPU usage, logs, etc.). The code creates a structured prompt, often in JSON format required by the Claude model: for example, a list of messages like
 
-This is the main function invoked by AWS Lambda whenever SNS publishes a message to this function’s subscription.
+   ```json
+   [
+     {"role": "system", "content": "<system instructions>"},
+     {"role": "user", "content": "<the collected data and alarm details>"}
+   ]
+   ```
 
-```python
-record  = event['Records'][0]['Sns']
-raw_msg = record.get('Message', "")
-```
+   These keys (`"role"` and `"content"`) and the JSON format exactly match what Amazon Bedrock’s Claude API expects.
 
-* We extract the first SNS record and get its raw message string.
+5. **Calls the Amazon Bedrock API:** The code then invokes the Bedrock client (`boto3.client('bedrock-runtime')`) with `invoke_model()`. It specifies `ModelId='anthropic.claude-v2:1'` (or a similar version tag) and passes the prompt in the request body as a JSON string. It also sets `ContentType='application/json'` and `Accept='application/json'`. This tells Bedrock to run the Claude-v2 model. The call is wrapped in a try/except block:
 
-```python
-source_attr = record.get('MessageAttributes', {}) \
-                    .get('source', {}) \
-                    .get('StringValue')
-if source_attr == "remediation":
-    return {'statusCode': 200, 'body': 'skipped'}
-```
+   * **On success:** The Bedrock API returns a streamed JSON response. The code reads the full response body and parses it as JSON. We expect the AI’s response to contain a structured plan, for example a JSON object with an `"actions"` list. The code stores this in a variable like `action_plan`.
 
-* **Loop Prevention**: If the incoming SNS record has a message attribute `source = "remediation"`, it means this message is one we ourselves published after handling an alarm. We immediately return with a 200 status, doing nothing further. This avoids an infinite loop of Lambda → SNS → Lambda → SNS, etc.
+   * **On failure (fallback):** If the Bedrock call throws an exception (for example, network issues, rate limits, or the model is down), the `except` block activates. In that case, the code logs a warning and calls the default actions helper to get a **fallback plan**. This default plan is a pre-defined list of corrective steps (such as “restart the web server”, “clear disk space”, etc.) to ensure the system still tries to recover even without AI help.
 
----
+6. **Processes the action plan:** Once it has either the AI-generated plan or the default plan, the handler may do some final processing. For example, it might verify the plan is valid JSON, or add contextual info to each action. It may also implement **loop prevention** logic here: if the same alarm has fired repeatedly and the last action didn’t fix it, the code could detect that (perhaps by including a counter or timestamp in state) and decide not to repeat the same fix again. If such a loop is detected, the code logs this and could either exit or choose an alternate action.
 
-## 3. JSON Path: Handling a New CloudWatch Alarm
+7. **Executes the actions using SSM:** For each action in the plan, the handler again calls AWS SSM. It might use `send_command()` for each remediation step (for example, one command to reboot an instance, another to apply a patch). If any action is potentially disruptive (like rebooting a server), the code might schedule it for a low-traffic time. This is the “Smart Timing” feature: the code checks the current time or includes a delay so that, for example, a reboot happens at 2 AM instead of peak hours. The code could use `Waiter` or even set the `ExecutionStartTime` parameter if using an Automation document. In any case, after sending each SSM command, it waits for completion (or logs it as “scheduled” if delayed). If an action fails to execute, the handler logs an error but continues with the remaining steps.
 
-```python
-if is_json(raw_msg):
-    sns_msg = json.loads(raw_msg)
-```
+8. **Sends notifications:** After execution (or scheduling), the handler prepares a summary message. This summary includes which actions were taken (or scheduled) and any relevant results (e.g. “Reboot command sent to instance i-0123abcd”). It then calls the **Slack/email notification helper** (from step 1) with this summary. The helper posts the message to Slack via the incoming webhook URL and sends an email via SES to the configured address. If both succeed, the operations team is informed through both channels. If one fails, the code still logs the result of the other. For example, if Slack returns an HTTP 500, it logs “Slack notification failed” but still sends the email.
 
-* If `raw_msg` is valid JSON, we parse it into a Python dictionary (`sns_msg`).
-* This branch only executes when CloudWatch actually sends its alarm payload (not our own plaintext).
+9. **Handles unexpected input:** As a final branch, if the `event` does not match the expected format (not an SNS/CloudWatch payload), the handler logs an error like “Unexpected event format” and exits gracefully. This ensures the function only attempts remediation when triggered properly.
 
-### 3.1 Check Transition into ALARM
+Throughout the entry point, the code uses environment variables and parameters that should match the documentation: for example, `MODEL_ID='anthropic.claude-v2:1'`, `SLACK_WEBHOOK_URL`, `ALERT_EMAIL_ADDRESS`, `DEFAULT_ACTIONS` (if any), etc. Every time a field from `event` or `action_plan` is accessed, the doc refers to the exact key name (for example, `action_plan['actions']` is used to iterate over tasks).
 
-```python
-old_state = sns_msg.get("OldStateValue", "")
-new_state = sns_msg.get("NewStateValue", "")
-if not (old_state != "ALARM" and new_state == "ALARM"):
-    return {'statusCode': 200, 'body': 'skipped non-transition'}
-```
+## 3. Data Gathering (SSM Run Command)
 
-* We inspect `OldStateValue` and `NewStateValue`:
+This section is essentially a sub-step of the entry point, but it’s useful to detail because it has important logic. When the function needs to collect data from EC2:
 
-  * Only proceed if **it was not already “ALARM”** and now it **just turned to “ALARM.”**
-  * If the alarm was already in “ALARM” (or the state did not actually transition), we do nothing.
+* It determines the right target instances (from the alarm or a fixed list).
+* It constructs SSM Run Command parameters. For example, it may build a list of shell commands to run diagnostics. The code uses `send_command(Targets=[{ "Key": "InstanceIds", "Values": [instance_id] }], DocumentName='AWS-RunShellScript', Parameters={'commands': commands_list})`.
+* It waits for the command to complete. If the command takes too long, it may time out or move on with partial data.
+* It retrieves the result by calling `get_command_invocation(CommandId=..., InstanceId=...)` or using a waiter loop. It reads the `StandardOutputContent`.
+* If fetching the result fails (say the instance is offline), the code logs a warning. In that case, it may still proceed but note that data is incomplete. This is a branch: *if real-time data is unavailable, fall back to static or last-known data (if implemented), or simply note “data fetch failed” in the prompt.*
 
-### 3.2 Extract Alarm Details
+All these fields (`Targets`, `DocumentName`, `Parameters`, `CommandId`, etc.) match exactly the boto3 SSM API. The documentation should mention them by name so it’s clear how the code is calling SSM. For example, it should say the code uses `ssm.send_command(...).get('CommandId')` and later `ssm.get_command_invocation(...)` with that ID.
 
-```python
-alarm_name = sns_msg.get('AlarmName', 'UnknownAlarm')
-timestamp  = sns_msg.get('StateChangeTime', 'UnknownTime')
-```
+## 4. AI Planning with Bedrock Claude-v2
 
-* Retrieve the alarm’s name (e.g. `SmartOps-CPU-Alarm`) and the time of this state change.
+In this section, the code hands off the collected data to the AI model. Key points:
 
-```python
-alarm_type = 'cpu'
-if 'memory' in alarm_name.lower():
-    alarm_type = 'memory'
-```
+* **Model ID:** The code uses `anthropic.claude-v2:1` (or the exact version) as the model identifier. This is passed as `ModelId` in the `invoke_model` call.
+* **Request format:** It sends the data in a JSON body. Specifically, for Claude v2 the code wraps the text in a `"messages"` list with roles. For example:
 
-* Determine whether this is a CPU alarm or a Memory alarm by checking if “memory” appears in the alarm name. Default is CPU.
-
-### 3.3 Find the Affected EC2 Instance ID
-
-```python
-instance_id = None
-trigger = sns_msg.get('Trigger', {}) or sns_msg.get('trigger', {})
-for d in trigger.get('Dimensions', trigger.get('dimensions', [])):
-    dim_name = d.get('Name') or d.get('name')
-    if dim_name == 'InstanceId':
-        instance_id = d.get('Value') or d.get('value')
-        break
-```
-
-* CloudWatch SNS alarm messages include a `Trigger` block with `Dimensions`. One dimension’s `Name` is `InstanceId`. We loop through `Dimensions` to find that name and capture the associated `Value` (e.g. `i-04423b62c40d3f746`).
-
----
-
-## 4. Section A: Fetch EC2 Metadata (`resource_details` + `metrics_url`)
-
-```python
-if instance_id:
-    try:
-        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
-        inst = resp['Reservations'][0]['Instances'][0]
-    except:
-        inst = {}
-```
-
-* If we successfully found an `instance_id`, we call `describe_instances` on the EC2 client to retrieve all details about that EC2 instance. If anything fails, we set an empty dictionary so subsequent dictionary lookups default to `'N/A'`.
-
-```python
-name_tag   = next((t['Value'] for t in inst.get('Tags', []) if t['Key']=='Name'), 'N/A')
-inst_type  = inst.get('InstanceType', 'N/A')
-state      = inst.get('State', {}).get('Name', 'N/A')
-az         = inst.get('Placement', {}).get('AvailabilityZone', 'N/A')
-launch_iso = inst.get('LaunchTime').isoformat() if inst.get('LaunchTime') else 'N/A'
-priv_ip    = inst.get('PrivateIpAddress', 'N/A')
-pub_ip     = inst.get('PublicIpAddress', 'N/A')
-```
-
-* We extract the following:
-
-  * **Name** (from the “Name” tag, or “N/A” if missing).
-  * **Instance Type** (e.g. `t2.small`).
-  * **State** (e.g. `running` or `stopped`).
-  * **Availability Zone** (e.g. `us-east-1b`).
-  * **Launch Time** (ISO format string, or “N/A” if no `LaunchTime`).
-  * **Private IP** and **Public IP**.
-
-```python
-resource_details = (
-    f"Name: {name_tag}\n"
-    f"InstanceId: {instance_id}\n"
-    f"Type: {inst_type}\n"
-    f"State: {state}\n"
-    f"AZ: {az}\n"
-    f"Launched: {launch_iso}\n"
-    f"Private IP: {priv_ip}\n"
-    f"Public IP: {pub_ip}"
-)
-```
-
-* We build a multi‐line string named `resource_details` containing each of these values on its own line.
-
-```python
-metrics_url = (
-    f"https://{AWS_REGION}.console.aws.amazon.com/cloudwatch/home"
-    f"?region={AWS_REGION}#resource-health:dashboards/ec2/{instance_id}?~"
-    f"(leadingMetric~'*22{alarm_type}-utilization*22)"
-)
-```
-
-* We also craft a `metrics_url` that, when clicked, opens the AWS Console metrics dashboard for this EC2 instance (highlighting either CPU utilization or Memory utilization, depending on `alarm_type`).
-
-```python
-else:
-    resource_details = "No EC2 instance ID found in alarm."
-    metrics_url      = "N/A"
-```
-
-* If no `instance_id` was found in the alarm JSON, we fall back to placeholder text.
-
----
-
-## 5. Section B: Fetch Top 5 Processes via SSM (`top_processes`, `top_process_name`)
-
-```python
-top_processes    = "Not available"
-top_process_name = "Unknown"
-```
-
-* Default placeholders if SSM fails or no instance is found.
-
-```python
-if instance_id:
-    try:
-        if alarm_type == "cpu":
-            shell_cmd = "ps -eo pid,comm,%cpu --sort=-%cpu | head -n6"
-        else:
-            shell_cmd = "ps -eo pid,comm,%mem --sort=-%mem | head -n6"
-```
-
-* We choose a shell command string based on the alarm type:
-
-  * **CPU alarm**: list the top 5 CPU consumers (plus header line), sorted by `%CPU`.
-  * **Memory alarm**: list the top 5 Memory consumers (plus header line), sorted by `%MEM`.
-
-```python
-cmd = ssm_client.send_command(
-    InstanceIds=[instance_id],
-    DocumentName="AWS-RunShellScript",
-    Parameters={"commands": [shell_cmd]},
-    TimeoutSeconds=30
-)
-cmd_id = cmd["Command"]["CommandId"]
-```
-
-* We dispatch that command to SSM’s `AWS-RunShellScript` Document on the target instance. We get back a `CommandId` which we will poll for completion.
-
-```python
-max_retries = 8
-retry_delay = 2
-inv = None
-for attempt in range(max_retries):
-    try:
-        inv = ssm_client.get_command_invocation(
-            CommandId=cmd_id,
-            InstanceId=instance_id
-        )
-        if inv["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
-            break
-    except ClientError as error:
-        if error.response['Error']['Code'] == 'InvocationDoesNotExist':
-            time.sleep(retry_delay)
-            continue
-        else:
-            raise
-    time.sleep(retry_delay)
-```
-
-* We poll up to 8 times, waiting 2 seconds between attempts, until the SSM command’s status is one of `Success`, `Failed`, `TimedOut`, or `Cancelled`. We handle the occasional `InvocationDoesNotExist` error by waiting briefly and retrying.
-
-```python
-if inv and inv["Status"] == "Success":
-    top_processes = inv["StandardOutputContent"].strip()
-    lines = top_processes.splitlines()
-    if len(lines) >= 2:
-        first_proc_line = lines[1].strip()
-        parts = first_proc_line.split()
-        if len(parts) >= 2:
-            top_process_name = parts[1]
-elif inv:
-    top_processes = f"SSM command status: {inv['Status']}"
-else:
-    top_processes = "SSM command did not complete"
-```
-
-* If the command succeeded, we:
-
-  1. Grab the raw STDOUT text in `top_processes`. It looks like:
-
-     ```
-     PID COMMAND         %CPU
-     1234 java           75.0
-     5678 python         13.5
-     …  
-     ```
-  2. Split into lines and parse the second line (`lines[1]`) to isolate the process name of the very top consumer (e.g. `java`). That becomes `top_process_name`, used only if AI’s plan is missing or generic.
-* If the SSM command ran but did not succeed, we note that status text.
-* If there was no invocation at all, we mark that as a failure.
-
-```python
-except Exception as e:
-    top_processes = f"Error fetching processes via SSM: {e}"
-```
-
-* Any unexpected exception yields a human‐readable error string in place of `top_processes`.
-
----
-
-## 6. Section C: Ask Bedrock (Claude-v2) for Advice + JSON Plan
-
-```python
-metric_unit = "%CPU" if alarm_type == "cpu" else "%MEM"
-prompt = (
-    f"Human: A CloudWatch alarm '{alarm_name}' for EC2 instance {instance_id or 'Unknown'} "
-    f"fired at {timestamp} due to high {alarm_type.upper()} usage.\n\n"
-    f"The top process consuming {metric_unit} is: '{top_process_name}'.\n"
-    f"Here are the top 5 processes by {metric_unit}:\n{top_processes}\n\n"
-
-    "###ADVICE###\n"
-    "Please provide a clear, concise paragraph of human-friendly advice "
-    "for a cloud engineer explaining what to check and how to fix this.\n\n"
-
-    "###PLAN###\n"
-    "Now output a JSON object with:\n"
-    "  \"actions\": [ { \"type\": \"ssm_command\", \"description\": \"…\", \"commands\": [\"…\"] }, … ],\n"
-    "  \"justifications\": [ \"…\", \"…\" ]\n"
-    "Do not output anything except those two sections, separated by the markers above.\n"
-    "Assistant:"
-)
-```
-
-* We build a single prompt string that contains:
-
-  1. A brief summary of the alarm event (instance, time, CPU vs Memory).
-  2. The raw “top 5 processes” text from SSM.
-  3. The marker `###ADVICE###` followed by a request for a single paragraph of plain‐English troubleshooting advice.
-  4. The marker `###PLAN###` followed by a request to output a JSON object containing:
-
-     * An `"actions"` array of objects, each with:
-
-       * `"type": "ssm_command"`
-       * `"description": "…"`
-       * `"commands": ["…"]`
-     * A parallel `"justifications"` array of strings explaining why each action is recommended.
-  5. A final instruction: “Do not output anything except those two sections.”
-
-```python
-try:
-    resp = bedrock_client.invoke_model(
-        modelId=MODEL_ID,
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps({
-            "prompt": prompt,
-            "max_tokens_to_sample": 400,
-            "temperature": 0.5
-        })
-    )
-    raw = resp["body"].read().decode('utf-8')
-except Exception:
-    raw = "###ADVICE###\nBedrock unavailable; defaulting to kill top process.\n\n###PLAN###\n{}"
-```
-
-* We send that prompt to Bedrock’s `anthropic.claude-v2` model.
-* If Bedrock is unreachable or errors out, we use a fallback:
-
-  * Advice: “Bedrock unavailable; defaulting to kill top process.”
-  * Plan: empty JSON object (which triggers our fallback logic later).
-
-```python
-# C1) If Bedrock returned {"type":"completion","completion":…}, extract it
-try:
-    maybe_obj = json.loads(raw)
-    if isinstance(maybe_obj, dict) and "completion" in maybe_obj:
-        raw = maybe_obj["completion"]
-except:
-    pass
-```
-
-* Sometimes Bedrock returns a JSON envelope like:
-
-  ```json
-  {"type":"completion","completion":"<actual text including ###ADVICE### and ###PLAN###>"}
-  ```
-* We detect that envelope and extract the `"completion"` field so that `raw` holds exactly the AI’s content (the two marked sections).
-
----
-
-## 7. Section D: Split AI Output into `advice_main` and `plan_obj`
-
-```python
-advice_main = ""
-plan_obj    = {}
-if "###ADVICE###" in raw and "###PLAN###" in raw:
-    parts = raw.split("###PLAN###", 1)
-    advice_section = parts[0].replace("###ADVICE###", "").strip()
-    plan_section   = parts[1].strip()
-    advice_main    = advice_section
-    try:
-        plan_obj = json.loads(plan_section)
-    except:
-        plan_obj = {}
-else:
-    advice_main = raw
-    plan_obj    = {}
-```
-
-* If the AI’s text contains both markers (`###ADVICE###` and `###PLAN###`):
-
-  1. We split on `###PLAN###` to isolate the advice vs. the JSON plan.
-  2. We remove `###ADVICE###` from the first half and store that as `advice_main` (human‐friendly paragraph).
-  3. We parse the second half as JSON, storing the result in `plan_obj`. If parsing fails, we use an empty dictionary.
-* If the markers are missing entirely, we treat the entire AI response as `advice_main` and leave `plan_obj` empty.
-
----
-
-## 8. Section E: Fallback if AI Provided No Actions
-
-```python
-if not plan_obj.get("actions"):
-    if top_process_name and top_process_name != "Unknown":
-        plan_obj["actions"] = [{
-            "type":        "ssm_command",
-            "description": f"Kill top process '{top_process_name}' to reduce load",
-            "commands":    [f"sudo pkill -9 {top_process_name}"]
-        }]
-        plan_obj["justifications"] = [
-            f"Killing '{top_process_name}' will immediately reduce CPU/Memory usage."
-        ]
-    else:
-        plan_obj["actions"]        = []
-        plan_obj["justifications"] = []
-```
-
-* If `plan_obj["actions"]` is missing or empty, we create a single fallback action:
-
-  * **Type**: `ssm_command`
-  * **Description**: “Kill top process `<name>` to reduce load.”
-  * **Commands**: A list containing `sudo pkill -9 <name>`.
-  * We also add a justification explaining why we are killing that process.
-* If we could not identify any top process (e.g. `top_process_name == "Unknown"`), we leave both arrays empty.
-
----
-
-## 9. Section F: Execute SSM Actions, Deferring Any Reboot
-
-```python
-executed_actions = []
-justifications   = plan_obj.get("justifications", [])
-deferred_reboot  = None
-
-for idx, action in enumerate(plan_obj.get("actions", [])):
-    if action.get("type") == "ssm_command" and instance_id:
-        cmd_list      = action.get("commands", [])
-        description   = action.get("description", "")
-        justification = justifications[idx] if idx < len(justifications) else ""
-```
-
-* We prepare:
-
-  * An empty list `executed_actions` to record each SSM command we run.
-  * A reference list `justifications` so we can attach the correct justification to each action.
-  * A variable `deferred_reboot = None` to capture any “reboot” steps without executing them immediately.
-
-```python
-# Defer any “reboot” command
-if any("reboot" in c.lower() for c in cmd_list):
-    deferred_reboot = {
-        "description":   description,
-        "commands":      cmd_list,
-        "justification": justification
-    }
-    continue
-```
-
-* If any command in `cmd_list` contains the substring `"reboot"` (case‐insensitive), we push the entire action object into `deferred_reboot` and skip running it for now.
-* This ensures we do not accidentally reboot the instance before we send Slack/email.
-
-```python
-# Normalize “kill <stress_pid>” or “grep stress” → “sudo pkill -9 stress”
-final_cmds = []
-for c in cmd_list:
-    if "<stress_pid>" in c or "grep stress" in c:
-        final_cmds = [f"sudo pkill -9 {top_process_name}"]
-        break
-if not final_cmds:
-    final_cmds = cmd_list
-```
-
-* If AI wrote a generic placeholder command like `kill <stress_pid>` or “grep stress,” we replace it with a concrete `sudo pkill -9 <top_process_name>`. Otherwise, we use `cmd_list` as‐is.
-
-```python
-try:
-    ssm_resp = ssm_client.send_command(
-        InstanceIds=[instance_id],
-        DocumentName="AWS-RunShellScript",
-        Parameters={"commands": final_cmds},
-        TimeoutSeconds=60
-    )
-    cmd_id = ssm_resp["Command"]["CommandId"]
-    executed_actions.append({
-        "description":   description,
-        "commands":      final_cmds,
-        "command_id":    cmd_id,
-        "status":        "SENT",
-        "justification": justification
-    })
-except ClientError as e:
-    executed_actions.append({
-        "description":   description,
-        "commands":      final_cmds,
-        "status":        f"FAILED: {str(e)}",
-        "justification": justification
-    })
-```
-
-* We send the final commands via SSM. If SSM accepts them, we record:
-
-  * `description`
-  * the actual `commands` array we sent
-  * the returned `command_id`
-  * `status = "SENT"`
-  * `justification`
-* If SSM throws an error (e.g. instance offline, IAM missing), we record the failure with the error message in `status`.
-
----
-
-## 10. Section G: Scrub AWS Documentation URLs from Advice
-
-```python
-urls       = re.findall(r'https?://(?:docs\.aws\.amazon\.com|aws\.amazon\.com)/\S+', advice_main)
-valid_urls = []
-for u in urls:
-    try:
-        r = http.request("HEAD", u, timeout=5.0)
-        if 200 <= r.status < 400:
-            valid_urls.append(u)
-    except:
-        pass
-if valid_urls:
-    advice_main = advice_main.split(valid_urls[0])[0].strip()
-    advice_main += "\n\nAWS Documentation Links:\n" + "\n".join(valid_urls)
-```
-
-* We search the advice paragraph for any links to AWS documentation (`docs.aws.amazon.com` or `aws.amazon.com`).
-* For each URL found, we send an HTTP `HEAD` request to confirm the link is still live (status code 200–399).
-* We collect any “valid” links into `valid_urls`. If we found at least one valid link:
-
-  1. We remove everything from the first link onward in `advice_main` (so that the paragraph remains concise).
-  2. We append a new section at the bottom of `advice_main` listing all the `valid_urls` under “AWS Documentation Links:”.
-
-This keeps the advice paragraph focused on troubleshooting steps, while still preserving clickable reference links at the end.
-
----
-
-## 11. Section H: Send One Single Slack Notification (Nine Fields)
-
-```python
-if SLACK_WEBHOOK_URL:
-    if executed_actions:
-        actions_taken_lines = []
-        for x in executed_actions:
-            actions_taken_lines.append(
-                f"- Description: {x['description']}\n"
-                f"  Commands: {x['commands']}\n"
-                f"  Status: {x['status']}\n"
-                f"  Justification: {x.get('justification','')}"
-            )
-        if deferred_reboot:
-            actions_taken_lines.append(
-                f"- Description: {deferred_reboot['description']}\n"
-                f"  Commands: {deferred_reboot['commands']}\n"
-                "  Status: PENDING REBOOT\n"
-                f"  Justification: {deferred_reboot['justification']}"
-            )
-        actions_taken_str = "\n\n".join(actions_taken_lines)
-    else:
-        actions_taken_str = "No automated actions were taken."
-
-    slack_payload = {
-        "alarm_name":       alarm_name,
-        "timestamp":        timestamp,
-        "resource_details": resource_details,
-        "metrics_type":     alarm_type.upper(),
-        "metrics_url":      metrics_url,
-        "processes_type":   alarm_type.upper(),
-        "top_processes":    top_processes,
-        "advice":           advice_main,
-        "actions_taken":    actions_taken_str
-    }
-
-    max_retries = 2
-    for attempt in range(max_retries + 1):
-        try:
-            response = http.request(
-                "POST",
-                SLACK_WEBHOOK_URL,
-                body=json.dumps(slack_payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
-            )
-            if response.status == 200:
-                break
-        except:
-            time.sleep(2 ** attempt)
-```
-
-* We only send Slack after all SSM commands have been attempted, so that `actions_taken` is final.
-* We build a multi‐line string `actions_taken_str`. For each entry in `executed_actions`, we add:
-
-  ```
-  - Description: <…>
-    Commands: <…>
-    Status: <…>
-    Justification: <…>
+  ```python
+  prompt_body = {
+    "messages": [
+      {"role": "system", "content": system_instructions},
+      {"role": "user", "content": user_data_and_alarm}
+    ],
+    "temperature": 0.7  # (if included as a parameter)
+  }
   ```
 
-  on separate lines. If there is a deferred reboot, we append that as well with `Status: PENDING REBOOT`.
-* If no actions were executed, we set `actions_taken_str = "No automated actions were taken."`
-* Then we create a JSON object `slack_payload` with exactly these nine keys:
+  Then it does `bedrock_client.invoke_model( Body=json.dumps(prompt_body), ContentType='application/json', Accept='application/json', ModelId=MODEL_ID )`. The documentation should explain that the messages structure and fields like `"role"` come from Claude’s expected input format.
+* **Streaming vs full response:** This code may choose to read the full response at once. In either case, it ultimately calls `response = bedrock_client.invoke_model(...).get("body").read()` to get the raw JSON string. It then does `json.loads(response)` to turn it into a Python object `ai_response`.
+* **Content of response:** The AI is instructed (via system prompt) to output a **machine-readable JSON action plan**. The code expects `ai_response['actions']` to be a list of steps, where each step is itself a JSON object with fields like `"description"` and `"command"`. The documentation should describe the structure: e.g. “the code looks for an `actions` array in the JSON, where each element is a dict containing what operation to do.” The keys used (like `'actions'`, `'description'`, `'command'`) should be exactly as in code.
+* **Error handling:** If Bedrock returns an error, or if the returned JSON does not have the expected fields, the code triggers the fallback mechanism (as mentioned) and sets `action_plan` to a default list. It also logs a message like “Bedrock model failed; using default actions.” This branch ensures the workflow continues safely.
+* **Loop prevention logic:** The documentation should note any code that checks previous state. For example, if the code keeps a flag in a DynamoDB table or cache to say “we already tried reboot” and the alarm is still firing, it might skip that action. If such logic exists, it is explained here: “the code checks a persistent flag to see if the same remediation was already applied recently. If yes, it avoids repeating it and may escalate or notify manually.”
 
-  1. **alarm\_name**: The name of the alarm that fired.
-  2. **timestamp**: The time the alarm went to “ALARM.”
-  3. **resource\_details**: Multi‐line string of instance metadata.
-  4. **metrics\_type**: `"CPU"` or `"MEMORY"` (uppercase).
-  5. **metrics\_url**: The CloudWatch metrics console link.
-  6. **processes\_type**: `"CPU"` or `"MEMORY"` (same as `metrics_type`).
-  7. **top\_processes**: The raw text output (top 5 lines) from the SSM “ps” command.
-  8. **advice**: The AI‐generated troubleshooting paragraph (with documentation links appended).
-  9. **actions\_taken**: The multi‐line description of every SSM command that was sent (or “No automated actions were taken.”).
-* We issue an HTTP POST to the Slack Incoming Webhook (`SLACK_WEBHOOK_URL`), converting our object to JSON and setting `Content-Type: application/json`. We retry up to 2 times (with exponential backoff) if the first attempt fails.
+In summary, this section explains how the code turns data into an AI request, calls Bedrock, and parses the response. It emphasizes that this is the **AI integration** step, and notes all parameters (`messages`, `ContentType`, model ID) exactly as used in the implementation.
 
----
+## 5. Execution and Notification
 
-## 12. Section I: Publish One Single Plaintext to SNS (for Outlook/Email)
+Finally, the code takes the chosen actions and carries them out, then tells the team what happened:
 
-```python
-subject         = f"[Alert] EC2 Alarm: {alarm_name}"
-metrics_label   = f"{alarm_type.upper()} Metrics Console"
-processes_label = f"Top 5 {alarm_type.upper()} Processes"
+* **Executing actions:** For each action in the final plan (AI-generated or default), the code sends it to SSM to execute on the target instances. This uses `ssm.send_command()` again, similar to the data-gathering step. The code may run commands like `sudo systemctl restart apache2` or `shutdown -r now`. It could do these synchronously, or queue them with a delay (if needed). The documentation should explain that each action’s details (`action["command"]`, etc.) come from the plan JSON and are used in `send_command`.
 
-executed_summary = "\n\n=== Actions Taken by AI ===\n"
-for x in executed_actions:
-    executed_summary += (
-        f"- Description: {x['description']}\n"
-        f"  Commands: {x['commands']}\n"
-        f"  Status: {x['status']}\n"
-        f"  Justification: {x.get('justification','')}\n\n"
-    )
-if deferred_reboot:
-    executed_summary += (
-        f"- Description: {deferred_reboot['description']}\n"
-        f"  Commands: {deferred_reboot['commands']}\n"
-        "  Status: PENDING REBOOT\n"
-        f"  Justification: {deferred_reboot['justification']}\n\n"
-    )
-elif not executed_actions:
-    executed_summary += "No automated actions were taken.\n"
-```
+* **Deferred scheduling (Smart Timing):** If an action is potentially disruptive, the code can wait until a maintenance window. This might mean calling SSM with a `Parameters={'ExecutionTimeoutSeconds': some_value}` or even invoking an AWS SSM Automation runbook with a cron schedule. The doc notes: “the code includes logic to delay disruptive tasks (like reboots) until off-peak hours. It checks the current time and, if needed, adjusts the plan. In practice, it might break the action into a separate SSM Automation that is scheduled for night-time.”
 
-* We prepare a human‐readable summary string `executed_summary` that will show up in the email. It begins with:
+* **Success/failure tracking:** After sending each command, the code checks the result. If SSM reports an error, the code logs it and continues with the next action. If an action succeeds or is scheduled, it records that outcome.
 
-  ```
-  === Actions Taken by AI ===
-  - Description: <…>
-    Commands: <…>
-    Status: <…>
-    Justification: <…>
-  ```
+* **Notifications:** After all actions are handled, the code calls the **notification helper** (from section 1) to inform the operations team. The message includes:
 
-  for every executed action. We also add any deferred reboot entry.
+  * The name of the alarm and what resource was affected.
+  * A summary of each action taken (e.g. “Restarted Apache on i-1234abcd”, “Reboot scheduled at 2 AM”).
+  * Any notable errors (if an action failed).
+    The doc should mention that the Slack message might include an attachment or bullet list of these steps, and that the email (via SES) has a similar summary. It also explains that these notifications use the exact fields and keys as defined in the code, matching any templates used there.
 
-```python
-message_body = (
-    f"Alarm: {alarm_name}\n"
-    f"Time: {timestamp}\n\n"
-    f"Resource Details:\n{resource_details}\n\n"
-    f"{metrics_label}:\n{metrics_url}\n\n"
-    f"{processes_label}:\n{top_processes}\n\n"
-    f"General Remediation Advice:\n{advice_main}"
-    f"{executed_summary}"
-)
-```
+* **Fallback in notifications:** As a branch, if the Slack webhook is missing or returns an error, the code logs this but still attempts to send the email. Conversely, if SES fails (perhaps due to missing permissions or misconfiguration), it logs an error but the Slack message has already gone through. The overall logic ensures that at least one channel notifies the team.
 
-* We build a plaintext `message_body` exactly in the format that Outlook (or any email) can consume. It contains:
+* **Ending the function:** After notifications, the handler completes. If everything went well, it returns a success message or simply ends without error. If a critical failure occurred (for example, inability to parse the event or load the default plan), the function might raise an exception so that AWS Lambda marks the invocation as a failure (which could trigger a retry or alert). The documentation notes this final conditional: “if something unexpected happened (like missing required fields in the input), the function raises an error so that AWS can handle it accordingly.”
 
-  1. **Alarm** and **Time** at the top (two lines).
-  2. Blank line, then **“Resource Details:”** followed by the multi‐line `resource_details` block.
-  3. Blank line, **“CPU Metrics Console:”** (or “Memory Metrics Console:”) and the `metrics_url` on its own line.
-  4. Blank line, **“Top 5 CPU Processes:”** (or “Top 5 Memory Processes:”) and the raw `top_processes` text.
-  5. Blank line, **“General Remediation Advice:”** and the AI’s advice paragraph.
-  6. Immediately after, the multi‐line `executed_summary` (showing which SSM commands were run and their status).
-* Because we send this **once** (after Slack), subscribers on that SNS topic will each receive exactly one email containing the entire context.
+## Summary of Logic Flow
 
-```python
-sns_client.publish(
-    TopicArn=SNS_TOPIC_ARN,
-    Subject=subject,
-    Message=message_body,
-    MessageAttributes={
-        "source": {"DataType":"String", "StringValue":"remediation"},
-        "slack":  {"DataType":"String", "StringValue":"true"}
-    }
-)
-```
-
-* We publish `message_body` back to SNS with two attributes:
-
-  1. `"source" = "remediation"`: Ensures that if this plaintext re‐invokes Lambda, we skip it (loop prevention).
-  2. `"slack" = "true"` (optional marker).
-* Because we attached `source="remediation"`, the next invocation from this same plaintext SNS message will see that attribute, immediately return, and never send Slack/email again.
-
-```python
-return {'statusCode': 200, 'body': json.dumps({'status': 'ok'})}
-```
-
-* Finally, we return an HTTP 200 so Lambda knows our function executed successfully.
-
----
-
-## 13. Plaintext Path: Skip Slack (When SNS Re‐Invokes with “Alarm:” Text)
-
-```python
-if raw_msg.startswith("Alarm:"):
-    # We used to send Slack here again; now we skip Slack.
-    # Outlook already got this plaintext as an email.
-    return {'statusCode': 200, 'body': 'skipped plaintext path (no Slack)'}
-```
-
-* If SNS has re‐sent our own plaintext (which always begins with “Alarm: \<alarm\_name>”), we simply return with a 200 and do nothing.
-* **Why**: We’ve already delivered the email once. We do not want to send Slack again or re‐execute the remediation steps. This prevents a “double post” to Slack or any repeated action.
-
----
-
-## 14. Unknown Format Path
-
-```python
-return {'statusCode': 200, 'body': 'skipped unknown format'}
-```
-
-* If the SNS message is neither valid JSON nor plaintext starting with “Alarm:”, we assume it’s some unrelated notification. We do nothing and return a 200 status.
-
----
-
-## 15. In Summary: End‐to‐End Flow
-
-1. **CloudWatch Alarm → SNS JSON**
-
-   * Lambda checks `OldStateValue` → `NewStateValue`: only proceed if the alarm just became “ALARM.”
-   * Gather EC2 metadata and top processes via SSM.
-   * Ask Bedrock AI for advice (paragraph) and plan (JSON).
-   * Execute any safe SSM actions immediately, deferring reboots.
-   * Scrub out AWS doc links, append at the bottom of advice.
-   * **Send one Slack message** with exactly nine fields:
-
-     1. `alarm_name`
-     2. `timestamp`
-     3. `resource_details`
-     4. `metrics_type`
-     5. `metrics_url`
-     6. `processes_type`
-     7. `top_processes`
-     8. `advice`
-     9. `actions_taken`
-   * **Publish one plaintext** back to SNS (same topic) with `source="remediation"` so email subscribers receive a single, complete email.
-
-2. **SNS “Plaintext” → Lambda**
-
-   * Raw message starts with `"Alarm:"`. This is exactly our own plaintext.
-   * Lambda sees it, does **not** send Slack or run any steps.
-   * Return 200.
-
-3. **Loop Prevention**
-
-   * The moment we publish back to SNS in step (1), that same plaintext would normally trigger Lambda again.
-   * We avoid doing anything on that invocation because:
-
-     * We added `MessageAttributes["source"] = "remediation"`.
-     * At the top of Lambda, we check if `source_attr == "remediation"`. If so, we immediately return “skipped.”
-   * This ensures a single pass for each alarm transition: one Slack post + one email, and nothing more.
-
----
-
-## 16. Why This Design Matters (Layman’s Perspective)
-
-* **Single Notification, No Spam**
-
-  * Engineers on Slack get one concise JSON containing everything they need.
-  * Ops teams on email get one single plaintext email.
-  * No partial updates, no repeated messages, no infinite loops.
-
-* **Automated Diagnosis & Remediation**
-
-  * The function checks “ps” on the instance for you.
-  * It submits your data to an AI model that generates a plain‐English explanation and a set of commands.
-  * It runs those commands instantly (e.g. “kill stress”) so you do not have to log in or type anything manually.
-
-* **Deferred Reboot**
-
-  * If AI thinks you should reboot, that command is deferred until notifications are sent.
-  * This way, you get to read the Slack message or email before the instance reboots.
-
-* **Clean Separation of Concerns**
-
-  1. **CloudWatch Alarm JSON** → triggers all logic, Slack + email.
-  2. **Plaintext message** (our own follow‐up) → triggers only “do nothing.”
-  3. **No reliance on manual intervention** once set up.
-
-* **Built‐In Transparency**
-
-  * Slack shows the raw “ps” output, so you know exactly which processes were high.
-  * The AI’s “advice” paragraph is human‐readable and immediately actionable.
-  * The “actions\_taken” section lists exactly which SSM commands were sent, with justifications.
-
-By reading this documentation, anyone (developer, DevOps engineer, or manager) can understand:
-
-* **Why** this Lambda exists (to automatically handle CPU/Memory alarms on EC2).
-* **How** it processes a new alarm end‐to‐end.
-* **What** each section of the code is responsible for.
-* **How** Slack and email notifications are triggered exactly once per alarm.
-* **How** any automatic remediation commands are chosen, normalized, and executed.
-
-In short, this Lambda acts as an AI‐powered “smart ops copilot” for EC2 alarms, doing diagnosis, advice, remediation, and notifications in a single, coherent workflow.
+1. **Trigger:** CloudWatch alarm → SNS → Lambda.
+2. **Parse event:** Read SNS message with alarm details.
+3. **Fetch data:** Use SSM RunCommand to gather instance/process info.
+4. **AI Planning:** Call Amazon Bedrock Claude-v2 with the data, parse JSON plan.
+5. **Fallback:** If Bedrock fails, use a static default plan.
+6. **Execute:** Run each action via SSM (reboots, service restarts, etc.), possibly scheduling delays.
+7. **Notify:** Send Slack message and email with the results.
+8. **Loop Prevention:** Avoid repeating failed fixes (if code includes this logic).
+9. **Error Handling:** Catch and log exceptions at each step, ensuring the code either completes gracefully or raises an error when needed.
