@@ -1,123 +1,129 @@
 # AI-Enhanced EC2 Alarm Remediation with AWS Bedrock
 
-Modern cloud environments generate **a high volume of alarms** (e.g. EC2 CPU or memory spikes) that can overwhelm engineers. Using **Amazon Bedrock (Anthropic Claude v2)**, we can automate the analysis of alarm context and produce clear remediation advice. This guide shows how to deploy a Lambda-based solution via the AWS console that uses Bedrock to simplify troubleshooting. When an EC2 alarm fires, the Lambda function runs commands on the instance via AWS Systems Manager (SSM) to list the top CPU/memory processes, sends that data to Claude for analysis, and then publishes the AI-generated guidance to an email (via SNS) and to Slack (via webhook). The result is concise, actionable advice delivered automatically to your team. This is a fully managed, serverless approach: **no infrastructure to maintain** in order to integrate advanced generative AI into your operations.
+Modern cloud environments generate **a high volume of alarms** (e.g. EC2 CPU or memory spikes) that can overwhelm on-call engineers. By integrating **Amazon Bedrock (Anthropic Claude v2)** into a Lambda-based workflow, you can automate data collection, AI-powered analysis, and remediation—all delivered to Slack and email without manual intervention. This guide walks you through deploying a serverless solution via the AWS Console.
 
-> **AI-Powered Benefit:** By leveraging a Bedrock foundation model, cloud engineers get instant, natural-language explanations of complex alarms. This augments human expertise and scales effectively to handle many alerts simultaneously.
+> **AI-Powered Benefit:** Engineers receive immediate, natural-language explanations of root causes plus precise corrective steps—no more guessing or digging through raw metrics.
 
-## 1. Create the Lambda IAM Role
+---
 
-1. In the AWS **IAM console**, choose **Roles ▶ Create role**. Select **Lambda** as the trusted entity.
-2. Attach the following managed policies (you may also create a custom policy bundle):
+## 1. Create the Lambda Execution Role
 
-   * **AWSLambdaBasicExecutionRole** (for CloudWatch Logs)
+1. In the AWS **IAM console**, choose **Roles ▶ Create role**.
+2. For **Trusted Entity**, select **Lambda**.
+3. Attach these managed policies (or equivalent custom policies):
 
-   * **AmazonSSMFullAccess** (to run SSM commands on instances)
+   * **AWSLambdaBasicExecutionRole** (CloudWatch Logs)
+   * **AmazonSSMFullAccess** (run commands)
+   * **AmazonEC2ReadOnlyAccess** (describe instances)
+   * **AmazonSNSFullAccess** (publish/subscribe)
+   * **AmazonBedrockFullAccess** (invoke Claude v2)
+4. Name it (e.g. `Lambda–Bedrock–Remediation–Role`) and note its ARN.
 
-   * **AmazonEC2ReadOnlyAccess** (to describe EC2 instances)
+> Granting **BedrockFullAccess** lets your function call Claude v2 for instant AI insights.
 
-   * **AmazonSNSFullAccess** (to publish messages and subscribe to SNS)
+---
 
-   * **AmazonBedrockFullAccess** (or AmazonBedrockReadOnly) (to invoke Bedrock models).
-
-   > **Tip:** Amazon Bedrock is a fully managed, serverless service providing high-performance AI models. Granting *BedrockFullAccess* lets the Lambda call Claude v2 for analysis.
-3. Name the role (e.g. `Lambda-Bedrock-Remediation-Role`) and create it. The role’s ARN will be used when creating the function.
-
-## 2. Configure CloudWatch Alarms (CPU and Memory)
+## 2. Configure CloudWatch Alarms
 
 ### 2.1 CPU Utilization Alarm
 
-* Open the **CloudWatch console ▶ Alarms ▶ All alarms**, then choose **Create alarm**.
-* Select the EC2 instance’s **CPUUtilization** metric. Define a threshold (e.g. >80% for 5 minutes) and choose **Next**.
-* Under **Actions**, select **Notify a topic**, then choose *AlarmTopic* (an SNS topic) or create one. This SNS topic will trigger the Lambda. Finally **Create alarm**.
+1. In **CloudWatch ▶ Alarms**, click **Create alarm**.
+2. Select your EC2 instance’s **CPUUtilization** metric; set threshold (e.g. > 80% for 5 minutes).
+3. Under **Actions**, choose **Notify SNS topic** and select (or create) `AlarmTopic`.
+4. Create the alarm.
 
 ### 2.2 Memory Utilization Alarm
 
-EC2 does not emit memory metrics by default. You must install the CloudWatch Agent to collect memory data:
+EC2 doesn’t emit memory metrics by default—you must install the CloudWatch Agent:
 
-1. **Install/Configure CloudWatch Agent on EC2**:
+1. Ensure the instance has the SSM Agent and an IAM instance profile (e.g. **AmazonSSMManagedInstanceCore**).
+2. In **Systems Manager ▶ Run command**, use **AWS-ConfigureCloudWatch** to install and configure the CloudWatch Agent, selecting memory metrics.
+3. After metrics flow into CloudWatch (namespace `CWAgent`), create an alarm on **mem\_used\_percent** (e.g. ≥ 90% for 3 periods) and point it to the **same SNS topic** (`AlarmTopic`).
 
-   * Ensure the instance has the SSM Agent running and an IAM instance profile (e.g. **AmazonSSMManagedInstanceCore**) so it’s managed by SSM.
-   * In the **CloudWatch console ▶ Agent status**, or via **Systems Manager Run Command**, install the CloudWatch Agent (AWS provides an SSM document **AWS-ConfigureCloudWatch**).
-   * Configure the agent to collect memory metrics (e.g. run the `amazon-cloudwatch-agent-config-wizard` on the instance, selecting memory and CPU). This publishes memory metrics (in the `CWAgent` namespace) to CloudWatch.
-   * For detailed steps, see AWS guidance: “You can setup memory metrics by installing and configuring CloudWatch agent on each EC2 instance.”.
+> Memory visibility is crucial for diagnosing high-memory processes.
 
-2. **Create Memory Alarm**:
-
-   * After the agent sends memory data (e.g. *mem\_used\_percent*), in CloudWatch create an alarm on that metric (for example, Memory % >= 90% for several periods).
-   * As with CPU, configure the alarm to **Notify the same SNS topic**. Now both high CPU and high memory alarms publish to SNS.
-
-> **Note:** Installing the CloudWatch agent gives you visibility into memory usage. This extra context is crucial for troubleshooting heavy-memory processes. AWS recommends customizing the agent to collect just the metrics you need, then alarms can be defined on those.
+---
 
 ## 3. Create and Configure the SNS Topic
 
-1. In the **SNS console ▶ Topics**, choose **Create topic**. Give it a name (e.g. `AlarmTopic`) and display name.
-2. **Subscribe the Lambda to the topic**:
+1. In **SNS ▶ Topics**, click **Create topic**; name it `AlarmTopic`.
+2. Open the topic and under **Subscriptions** choose **Create subscription**:
 
-   * After creating the topic, open it and under **Subscriptions** choose **Create subscription**.
-   * For **Protocol**, select **AWS Lambda**, and for **Endpoint**, pick the Lambda function you will create (or choose later). This ensures that whenever the alarm publishes to this topic, the Lambda is invoked with the alarm message.
-3. **Subscribe an email endpoint** for receiving the remediation advice:
+   * **Protocol:** AWS Lambda
+   * **Endpoint:** Your Lambda function (select later if needed)
+3. (Optional) Add an **Email** subscription to `AlarmTopic` to receive the final remediation email.
 
-   * If you want immediate email notifications, create another SNS topic (e.g. `AdviceTopic`) or reuse the same topic with a filter, and subscribe your operations email (choose **Protocol = Email**). Confirm the subscription via the email link.
-   * The Lambda will later publish its analysis to this topic to send out the advice.
+> All alarms now funnel through SNS → Lambda, forming an automated pipeline.
 
-> **AI-Powered Benefit:** By channeling alarms through SNS and Lambda, you create an automated pipeline. Each alarm’s details (instance ID, CPU/memory usage, etc.) become the input to the AI analysis, which generates context-rich guidance without manual intervention.
+---
 
-## 4. Set Up Slack Webhook
+## 4. Set Up Slack Incoming Webhook
 
-1. In your Slack workspace, create a **Slack App** (via *api.slack.com/apps*), add the **Incoming Webhooks** feature, and activate a webhook for the desired channel. Copy the generated **Webhook URL**.
-2. In the **Lambda function configuration** (next step), you will set an environment variable, e.g. `SLACK_WEBHOOK_URL`, to this URL. This lets the function send POST requests to Slack.
-
-   * To add this in the console: go to the Lambda’s **Configuration ▶ Environment variables**, click **Edit**, then **Add environment variable**. For example:
+1. In Slack, create an **App ▶ Incoming Webhooks**.
+2. Enable a webhook for your target channel and copy the **Webhook URL**.
+3. In your Lambda’s **Configuration ▶ Environment variables**, add:
 
    ```
-   SLACK_WEBHOOK_URL = https://hooks.slack.com/services/T0000/B0000/XXXX
+   SLACK_WEBHOOK_URL = https://hooks.slack.com/services/…
    ```
 
-> **AI-Powered Insight:** Having the Slack webhook as an environment variable allows the same function code to target any channel dynamically. The AI-driven advice will flow directly into chat alongside email, keeping your team informed wherever they collaborate.
+> Storing the URL as an environment variable keeps your code portable and secure.
 
-## 5. Create and Deploy the Lambda Function
+---
 
-1. In the **Lambda console ▶ Functions**, choose **Create function**. Name it (e.g. `EC2AlarmRemediation`), select the Python runtime, and set **Execution role** to the IAM role created earlier.
-2. Under **Configuration ▶ Environment variables**, ensure `SLACK_WEBHOOK_URL` (and any SNS topic ARN if needed) are set as above.
-3. Deploy the function code. Use the provided code template (or write your own) that does the following steps:
+## 5. Deploy the Lambda Function
 
-   * **Parse the SNS message** (JSON) to extract the EC2 instance ID and alarm details.
+1. In **Lambda ▶ Functions**, click **Create function**.
 
-   * **Use boto3 SSM** to run a command on the instance (e.g. `aws ssm send_command` with document `AWS-RunShellScript`) that returns the top processes by CPU or memory (for example, `ps aux --sort=-%mem | head -n 10`).
+   * **Name:** `EC2AlarmRemediation`
+   * **Runtime:** Python 3.x
+   * **Execution role:** `Lambda–Bedrock–Remediation–Role`
+2. Under **Configuration ▶ Environment variables**, ensure you’ve set:
 
-   * **Retrieve the command output** using `get_command_invocation` (poll until complete). Collect the text of top processes.
+   * `SLACK_WEBHOOK_URL`
+   * `SNS_TOPIC_ARN = arn:aws:sns:…:AlarmTopic`
+3. Paste or upload the provided Python code, which will:
 
-   * **Call Amazon Bedrock** (`invoke_model` or `invoke_model_with_response_stream` API) using Claude v2, sending a system/user message like:
+   1. **Parse the SNS message** to extract alarm details (instance ID, metric type, timestamp).
+   2. **Run SSM commands** on the instance to list the top CPU or memory processes.
+   3. **Invoke Bedrock (Claude v2)** with that data, requesting:
 
-     > *“The following processes on EC2 instance i-012345 show high CPU and memory usage (details below). What might be causing the resource spike, and what steps should be taken to resolve it?”*
-     > Include the command output in the prompt.
+      * A plain-English **advice** paragraph
+      * A JSON **action plan** of SSM commands + justifications
+   4. **Execute** any safe commands immediately (e.g. `pkill`), deferring reboots until after notifications.
+   5. **Post a single Slack message** (nine fields) with alarm context, AI advice, and actions taken.
+   6. **Publish one final plaintext SNS message** (tagged `source=remediation`) so email subscribers receive exactly one complete email.
+4. Increase function **timeout** (e.g. to 2 minutes) and **memory** (e.g. 512 MB).
+5. Save and **Deploy**.
 
-   * **Receive Claude’s response**, which should be a concise analysis and remediation steps.
+> **Pro Tip:** Enable CloudWatch Logs and sprinkle `print()` or `logging` statements at each step for easy debugging.
 
-   * **Publish the advice**: use boto3 SNS to publish the response text to the *AdviceTopic* (so it goes to your email list).
-
-   * **Post to Slack**: use a Python HTTP library (e.g. `requests`) to `POST` the response text to the `SLACK_WEBHOOK_URL`.
-4. Adjust function settings: increase timeout (e.g. 1–2 minutes) to allow SSM and Bedrock calls. Increase memory if needed.
-5. Save and test. You can create a test event that mimics the SNS alarm message JSON or simply publish a test message to the SNS topic to trigger the function.
-
-> **Pro Tip:** Include logging at each step (parsing SNS, SSM invocation, Bedrock input/output) for easier troubleshooting. Verify IAM permissions if the function fails to call SSM or Bedrock.
+---
 
 ## 6. Test the End-to-End Flow
 
-* **Simulate an Alarm:** Generate high CPU on your EC2 instance (e.g. run a CPU loop script) or use the **CloudWatch “Test alarm”** feature. The alarm should go into ALARM state and publish to SNS.
-* **Check Lambda Execution:** In CloudWatch Logs, view the Lambda logs to ensure it ran successfully and see the SSM and Bedrock outputs.
-* **Verify Email:** You should receive an email (via SNS) with a clear, AI-generated explanation of the problem and suggested fixes.
-* **Verify Slack:** Check the designated Slack channel – the Lambda should have posted the same advice via the webhook.
-* **Troubleshoot:** If something went wrong, check that the IAM role has correct permissions (especially SSM and Bedrock), that SSM Agent is running on the EC2, and that the CloudWatch Agent is sending memory metrics if testing memory alarms.
+1. **Trigger an alarm:** Generate high CPU on your EC2 (e.g. stress test), or use CloudWatch’s **Test alarm** feature.
+2. **Check Lambda logs:** In CloudWatch Logs, confirm the function ran successfully, collected data, and invoked Bedrock.
+3. **Verify notifications:**
 
-> **Result:** You now have a live system where CloudWatch alarms automatically trigger an LLM-powered analysis, turning raw metric data into human-friendly action items. This greatly accelerates incident response and reduces noise.
+   * Slack channel should receive a structured JSON message with advice and actions.
+   * Your email inbox (via SNS) should receive one clear, AI-driven remediation email.
+4. **Troubleshoot:** If something fails, verify:
 
-## Lambda Function Features (High-Level Workflow)
+   * IAM permissions (SSM, EC2, SNS, Bedrock).
+   * SSM Agent and CloudWatch Agent are running on the instance.
+   * Environment variables are set correctly.
 
-* **Automated Trigger:** The Lambda function is invoked by the SNS notification from a CloudWatch alarm. It doesn’t require manual action to start analysis.
-* **Context Gathering via SSM:** It runs predefined shell commands on the affected EC2 instance (through AWS Systems Manager) to fetch the **top resource-consuming processes**. This gives concrete context (e.g. which application or service is causing high load).
-* **AI Analysis with Bedrock (Claude v2):** The function sends the process list and alarm details to Amazon Bedrock’s Claude model. Claude quickly **interprets the data**, identifies likely causes (e.g. “Process X might be stuck in a loop”) and recommends specific remediation steps (e.g. “Kill the runaway process and check its logs.”).
-* **Multi-Channel Notification:** The AI-generated advice is then **pushed out to teams**: it’s sent as an email (via SNS) and also posted to Slack. Engineers see a clear summary of the issue and next steps without digging through raw metrics.
-* **No Manual Diagnosis Needed:** By leveraging Bedrock, the solution converts technical data into plain-English explanations, saving time. Instead of each alarm being a “mystery,” the function provides a ready-made report with possible fixes.
+> **Result:** Each alarm now triggers an AI-powered diagnostic report and remediation sequence, reducing MTTR and eliminating manual guesswork.
 
-> **AI-Powered Insight:** This Lambda is essentially an automated diagnostics assistant. It scales to handle many simultaneous alarms and provides standardized, easy-to-understand guidance. In high-volume environments, this means faster incident resolution and less strain on engineering teams.
+---
+
+## High-Level Workflow
+
+1. **Alarm → SNS → Lambda**
+2. **SSM Data Collection:** Top CPU/memory processes
+3. **AI Analysis:** Claude v2 generates advice + JSON plan
+4. **Remediation:** Commands executed automatically (reboots deferred)
+5. **Notifications:** One Slack post + one email (no duplicates)
+
+> This fully serverless solution brings generative AI directly into your incident response, **no infrastructure to maintain**, and scales effortlessly with every new alarm.
